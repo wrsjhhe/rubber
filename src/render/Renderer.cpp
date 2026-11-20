@@ -658,7 +658,11 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     if (o.debugChannel < 0 || o.debugChannel > 4)
         throw std::invalid_argument("Invalid debug channel");
     view.wait();
-    if (color)
+    // 光照与 HDR 是否产出，与"是否出 Beauty"不是一回事：presentation 的 HDR 描述符是
+    // 静态使用的，级联视图还要读它的内容，所以只要选了调试通道就必须有光照结果。
+    // 旧实现按 color 导入 HDR，几何-only + 调试通道因此引用了未导入的图。
+    const bool lighting = color || o.debugChannel != 0;
+    if (lighting)
         v.ensureColor();
     if (o.debugChannel != 0)
         v.ensureDebug();
@@ -723,19 +727,24 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     graph.bind(instanceId, *v.g[4]);
     graph.bind(depthImage, *v.depth);
     graph.bind(globalsBuffer, *v.globals);
-    // 颜色相关资源只在请求颜色时才导入：几何请求不分配也不需要它们。
+    // HDR 在"出颜色"或"选了调试通道"时都要导入：前者是时序解析的输入，
+    // 后者是 presentation 的静态绑定（级联通道真的采样它，其余通道要求绑定有效）。
+    // 显示图与历史槽只服务颜色链路，几何请求不分配也不需要它们。
     render::ImageHandle hdrImage, displayImage, historyImage[2];
-    if (color)
+    if (lighting)
     {
         hdrImage = graph.importImage("hdr", imageDesc(render::Format::Rgba16Float, v.w, v.h, colorUsage),
                                      graphLayout(v.hdr->layout), false);
+        graph.bind(hdrImage, *v.hdr);
+    }
+    if (color)
+    {
         displayImage = graph.importImage("display", imageDesc(render::Format::Rgba8Unorm, v.w, v.h, colorUsage),
                                          graphLayout(v.display->layout), false);
         for (int i = 0; i < 2; ++i)
             historyImage[i] = graph.importImage("history-" + std::to_string(i),
                                                 imageDesc(render::Format::Rgba16Float, v.w, v.h, historyUsage),
                                                 graphLayout(v.history[i]->layout), i == 1 - v.historySlot() && accumulate);
-        graph.bind(hdrImage, *v.hdr);
         graph.bind(displayImage, *v.display);
         graph.bind(historyImage[0], *v.history[0]);
         graph.bind(historyImage[1], *v.history[1]);
@@ -759,10 +768,10 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     res.metricDepth = {metric, v.g[3].get()};
     res.instanceId = {instanceId, v.g[4].get()};
     res.hardwareDepth = {depthImage, v.depth.get()};
-    res.hdr = {hdrImage, v.hdr.get()};
-    res.display = {displayImage, v.display.get()};
-    res.history[0] = {historyImage[0], v.history[0].get()};
-    res.history[1] = {historyImage[1], v.history[1].get()};
+    res.hdr = {hdrImage, lighting ? v.hdr.get() : nullptr};
+    res.display = {displayImage, color ? v.display.get() : nullptr};
+    res.history[0] = {historyImage[0], color ? v.history[0].get() : nullptr};
+    res.history[1] = {historyImage[1], color ? v.history[1].get() : nullptr};
     res.globals = {globalsBuffer, v.globals.get()};
     res.constants = &f;
     res.options = &o;
@@ -771,7 +780,7 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     res.width = v.w;
     res.height = v.h;
     res.shadowTile = v.tile;
-    res.color = color;
+    res.lighting = lighting;
     res.stable = color && o.taa && (o.readback || o.stableGeometry);
 
     unsigned slot = v.historySlot();
@@ -895,13 +904,17 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
         graph.exportBuffer(stagingBuffer);
     for (auto handle : {albedo, normalRough, motion, metric, instanceId, depthImage})
         graph.restoreImage(handle, Layout::ShaderRead);
+    // 只出光照不出 Beauty 的帧（几何-only + 调试通道）也必须把 HDR 放回可采样状态，
+    // 否则物理图像的布局与视图记录的布局会分叉。
+    if (lighting)
+        graph.restoreImage(hdrImage, Layout::ShaderRead);
     if (color)
-        for (auto handle : {hdrImage, displayImage, historyImage[0], historyImage[1]})
+        for (auto handle : {displayImage, historyImage[0], historyImage[1]})
             graph.restoreImage(handle, Layout::ShaderRead);
     if (debugImage)
         graph.restoreImage(debugImage, Layout::ShaderRead);
     graph.compile();
-    // 只有真实写入了颜色历史的帧才能推进历史状态。"需要颜色"（res.color）不等于"时序解析
+    // 只有真实写入了颜色历史的帧才能推进历史状态。"出颜色"不等于"时序解析
     // 执行了"：仅导出 Hdr 的请求没有 color 的导出根，未启用 TAA 时也没有副作用根，时序解析
     // 会被裁掉，此时颜色历史仍是上一份内容，提前推进会让下一帧误判静止并冻结旧图。
     const bool resolved = color && graph.executed(temporalHandle);

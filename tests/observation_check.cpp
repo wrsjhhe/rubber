@@ -5,20 +5,34 @@
 #include "sim/Renderer.hpp"
 #include "sim/VulkanInterop.hpp"
 #include <glm/gtc/matrix_transform.hpp>
+#include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 using namespace sim;
+
+// 阶段拿到的派生输出句柄只暴露只读描述与可写像素：改名、改尺寸、改格式在类型上不成立。
+static_assert(std::is_same_v<decltype(std::declval<DerivedSink>().write("x").desc()), const DerivedDesc&>);
+static_assert(std::is_same_v<decltype(std::declval<DerivedSink>().write("x").bytes()), std::span<uint8_t>>);
 
 void expect(bool condition, const char* message)
 {
     if (!condition)
         throw std::runtime_error(message);
+}
+bool hasPass(const View& view, std::string_view name)
+{
+    for (const auto& pass : view.activePasses())
+        if (pass == name)
+            return true;
+    return false;
 }
 uint32_t centerOf(const OutputData& data)
 {
@@ -51,14 +65,51 @@ class InverseDepthStage final : public SensorStage
     }
     void process(DerivedSink& sink) const override
     {
-        auto& output = sink.write("inverse-depth");
+        auto output = sink.write("inverse-depth");
         auto depth = sink.input().read(Channel::MetricDepth);
+        auto pixels = output.bytes();
         for (uint32_t i = 0; i < depth.info.width * depth.info.height; ++i)
         {
             float value = readFloat(depth, i);
             float inverse = value > 0 ? 1.f / value : 0.f;
-            std::memcpy(output.bytes.data() + size_t(i) * 4, &inverse, 4);
+            std::memcpy(pixels.data() + size_t(i) * 4, &inverse, 4);
         }
+    }
+};
+// 声明的宽度让 width * 每像素字节数越过 32 位：处理链必须拒绝，不能分配一块比声明更小的
+// 缓冲再让阶段按声明去写。`ran` 用来确认阶段根本没被执行。
+bool overflowRan = false;
+class OverflowStage final : public SensorStage
+{
+  public:
+    std::string_view name() const override
+    {
+        return "overflow";
+    }
+    std::vector<DerivedDesc> outputs(const Observation&) const override
+    {
+        return {{"overflow", PixelFormat::Rgba16Float, 0x40000001u, 1}};
+    }
+    void process(DerivedSink&) const override
+    {
+        overflowRan = true;
+    }
+};
+// 两个阶段声明同一个名字：谁都不应该拿到那块输出。
+class DuplicateStage final : public SensorStage
+{
+  public:
+    std::string_view name() const override
+    {
+        return "duplicate";
+    }
+    std::vector<DerivedDesc> outputs(const Observation& input) const override
+    {
+        auto& calibration = input.calibration();
+        return {{"inverse-depth", PixelFormat::R32Float, calibration.width, calibration.height}};
+    }
+    void process(DerivedSink&) const override
+    {
     }
 };
 // 试图把派生输出命名成真值通道：处理链必须整体拒绝。
@@ -190,6 +241,61 @@ try
             rejected = true;
         }
         expect(rejected, "Observation accepted a negative exposure duration");
+
+        // 元数据只能描述真正采样的那一帧：尺寸要与结果一致，内参与近远平面必须有效，
+        // 通道集合来自结果本身而不是调用方的另一份清单。
+        auto frame = observed.observation->result();
+        auto wrongSize = observed.observation->calibration();
+        wrongSize.width = 64;
+        wrongSize.height = 48;
+        rejected = false;
+        try
+        {
+            Observation forged(frame, wrongSize, {1.25, 0});
+        }
+        catch (const std::invalid_argument& error)
+        {
+            rejected = std::string(error.what()).find("size") != std::string::npos;
+        }
+        expect(rejected, "Observation accepted a calibration that does not match the frame");
+        auto badIntrinsics = observed.observation->calibration();
+        badIntrinsics.fx = std::numeric_limits<float>::quiet_NaN();
+        rejected = false;
+        try
+        {
+            Observation forged(frame, badIntrinsics, {1.25, 0});
+        }
+        catch (const std::invalid_argument& error)
+        {
+            rejected = std::string(error.what()).find("intrinsic") != std::string::npos;
+        }
+        expect(rejected, "Observation accepted non-finite intrinsics");
+        auto badFrustum = observed.observation->calibration();
+        badFrustum.farPlane = badFrustum.nearPlane;
+        rejected = false;
+        try
+        {
+            Observation forged(frame, badFrustum, {1.25, 0});
+        }
+        catch (const std::invalid_argument& error)
+        {
+            rejected = std::string(error.what()).find("frustum") != std::string::npos;
+        }
+        expect(rejected, "Observation accepted an empty frustum");
+        // 通道清单等于请求：没请求的通道无法被声明出来，读它会显式报错。
+        expect(observed.observation->outputs().size() == 1 && observed.observation->has(Channel::Color) &&
+                   !observed.observation->has(Channel::Hdr),
+               "Observation output list drifted from the request");
+        rejected = false;
+        try
+        {
+            observed.observation->read(Channel::Hdr);
+        }
+        catch (const std::invalid_argument&)
+        {
+            rejected = true;
+        }
+        expect(rejected, "Observation read a channel the frame never produced");
     }
 
     // 2. 呈现隔离：同一帧既出 Beauty 也出调试图，两份互不覆盖，历史里也只有 Beauty。
@@ -249,6 +355,77 @@ try
         rejected = std::string(error.what()).find("debug channel") != std::string::npos;
     }
     expect(rejected, "Debug channel was accepted without a debug channel selection");
+
+    // 2b. 几何-only 请求 + 调试通道：请求里没有 Debug，颜色链路不成立，但"选了调试通道
+    // 这一帧就产出调试图"仍然算数。presentation 的 HDR 绑定是静态使用的、级联视图还要
+    // 读它的内容，所以规划阶段就必须把光照与 HDR 带进来——不能等到声明时才去引用一张
+    // 没导入的图（旧实现正是如此），也不能让调试图采样未定义的内容。
+    {
+        auto controlView = renderer.createView(96, 64, 64);
+        auto control = renderer.observe({snapshot, camera, *controlView,
+                                         {{Channel::MetricDepth, Delivery::Cpu},
+                                          {Channel::InstanceId, Delivery::Cpu}},
+                                         flat});
+        expect(control.status == SubmitStatus::Submitted && control.observation,
+               "Geometry-only request was rejected");
+        auto controlDepth = control.observation->read(Channel::MetricDepth);
+        auto controlLabels = control.observation->read(Channel::InstanceId);
+        expect(!hasPass(*controlView, "lighting") && !hasPass(*controlView, "presentation"),
+               "Geometry-only request ran a color pass");
+        for (int channel : {1, 2, 3, 4})
+        {
+            auto geometryView = renderer.createView(96, 64, 64);
+            RenderOptions options = flat;
+            options.debugChannel = channel;
+            // 注意：没有 Debug 输出。调试图仍要生成，交给窗口采样。
+            auto observed = renderer.observe({snapshot, camera, *geometryView,
+                                              {{Channel::MetricDepth, Delivery::Cpu},
+                                               {Channel::InstanceId, Delivery::Cpu}},
+                                              options});
+            expect(observed.status == SubmitStatus::Submitted && observed.observation,
+                   "Geometry-only request with a debug channel was rejected");
+            // 调试呈现不改变几何真值：与不带调试通道的对照帧逐字节相同。
+            expect(observed.observation->read(Channel::MetricDepth).bytes == controlDepth.bytes,
+                   "Debug plan changed the geometry-only depth");
+            expect(observed.observation->read(Channel::InstanceId).bytes == controlLabels.bytes,
+                   "Debug plan changed the geometry-only labels");
+            expect(geometryView->debugView() != VK_NULL_HANDLE, "Geometry-only debug view is missing");
+            // 计划里必须有光照（HDR 需要有内容）与 presentation，但没有颜色链路。
+            expect(hasPass(*geometryView, "lighting") && hasPass(*geometryView, "presentation"),
+                   "Geometry-only debug frame did not plan lighting with presentation");
+            expect(!hasPass(*geometryView, "temporal") && !hasPass(*geometryView, "color"),
+                   "Geometry-only debug frame produced a beauty color pass");
+        }
+        // 同一帧把调试图也交付出来：内容按所选通道出图，背景为零、物体处非零。
+        auto deliveredView = renderer.createView(96, 64, 64);
+        RenderOptions delivered = flat;
+        delivered.debugChannel = 2;
+        auto observed = renderer.observe({snapshot, camera, *deliveredView,
+                                          {{Channel::MetricDepth, Delivery::Cpu},
+                                           {Channel::Debug, Delivery::Cpu}},
+                                          delivered});
+        auto debug = observed.observation->read(Channel::Debug);
+        expect(debug.bytes.size() == size_t(96) * 64 * 4, "Geometry-only debug output has the wrong size");
+        expect(debug.bytes[0] == 0 && debug.bytes[1] == 0 && debug.bytes[2] == 0,
+               "Geometry-only debug background is not zero");
+        expect(std::any_of(debug.bytes.begin(), debug.bytes.end(), [](uint8_t byte) { return byte != 0; }),
+               "Geometry-only debug view is empty");
+        expect(observed.observation->read(Channel::MetricDepth).bytes == controlDepth.bytes,
+               "Delivered debug output changed the geometry-only depth");
+
+        // GPU 交付的几何真值 + 调试通道同样成立：真值走导出复制，调试图留在视图里。
+        auto gpuGeometry = renderer.createView(96, 64, 64);
+        RenderOptions gpuOptions = flat;
+        gpuOptions.debugChannel = 3;
+        auto gpuObserved = renderer.observe({snapshot, camera, *gpuGeometry,
+                                             {{Channel::MetricDepth, Delivery::Gpu},
+                                              {Channel::InstanceId, Delivery::Gpu}},
+                                             gpuOptions});
+        auto nativeDepth = VulkanInterop::output(*gpuObserved.observation->result(), Channel::MetricDepth);
+        expect(nativeDepth.image && nativeDepth.view && nativeDepth.completion,
+               "Geometry-only debug frame has no GPU depth output");
+        expect(gpuGeometry->debugView() != VK_NULL_HANDLE, "GPU geometry-only frame has no debug view");
+    }
 
     // 3. 互操作边界：调试图同样以输出身份交付给 GPU 消费者，窗口采样同一份视图。
     auto gpuView = renderer.createView(96, 64, 64);
@@ -357,6 +534,45 @@ try
         rejected = std::string(error.what()).find("undeclared") != std::string::npos;
     }
     expect(rejected, "Stage wrote an output it never declared");
+
+    // 两个阶段抢同一个名字：整体拒绝，谁都不执行。
+    ProcessingChain duplicated("duplicated");
+    duplicated.add(std::make_unique<InverseDepthStage>());
+    duplicated.add(std::make_unique<DuplicateStage>());
+    rejected = false;
+    try
+    {
+        duplicated.run(chainObservation);
+    }
+    catch (const std::invalid_argument& error)
+    {
+        rejected = std::string(error.what()).find("Duplicate") != std::string::npos;
+    }
+    expect(rejected, "Chain allowed two stages to declare the same output");
+
+    // 声明宽度让行跨度越过 32 位：必须拒绝，而不是分配一块回绕后过小的缓冲。
+    ProcessingChain overflowing("overflow");
+    overflowing.add(std::make_unique<OverflowStage>());
+    rejected = false;
+    try
+    {
+        overflowing.run(chainObservation);
+    }
+    catch (const std::exception& error)
+    {
+        // 必须是"声明非法"被拒（invalid_argument），而不是分配后才发现尺寸不对。
+        rejected = dynamic_cast<const std::invalid_argument*>(&error) != nullptr &&
+                   std::string(error.what()).find("overflow") != std::string::npos;
+    }
+    expect(rejected, "Chain allocated a derived output whose stride overflows 32 bits");
+    expect(!overflowRan, "Chain ran a stage after rejecting its declaration");
+
+    // 交付的描述仍是声明的那一份：阶段改不到名字、格式与尺寸。
+    expect(inverse->desc.name == "inverse-depth" && inverse->desc.format == PixelFormat::R32Float &&
+               inverse->desc.width == 96 && inverse->desc.height == 64 && inverse->rowBytes == 96 * 4,
+           "Derived output description drifted from its declaration");
+    expect(processed.derived.size() == 1 && processed.find("inverse-depth") == inverse,
+           "Derived output list does not match the declaration");
 
     // 通道语义是公开契约，处理链的重名检查直接依赖它。
     expect(Observation::semantic(Channel::MetricDepth).groundTruth &&

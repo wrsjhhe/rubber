@@ -95,14 +95,14 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
     useScene(sceneRef);
     targets = {res.albedo.image, res.normalRough.image, res.motion.image, res.metricDepth.image,
                res.instanceId.image};
-    if (res.color)
+    if (res.lighting)
         ensureColor(res);
     // 实例历史是网格模块私有的视图缓冲：每帧导入并绑定，由帧图管理本帧的布局与屏障。
     const auto viewBuffer =
         graph.importBuffer("view-history", {viewData->size, render::BufferUsage::Storage}, true);
     graph.bind(viewBuffer, *viewData);
     render::ImageHandle shadowMap;
-    if (res.color)
+    if (res.lighting)
     {
         shadowMap = graph.importImage(
             "shadow", imageDesc(render::Format::D32Float, tile * 2, tile * 2, depthUsage, render::Aspect::Depth),
@@ -142,7 +142,7 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
     stationary = still;
     // 姿态基准不在这里推进：只有确认时序解析写入了颜色历史，commitHistory 才会提交它。
     stats.visibleMeshes = uint32_t(visibleItems.size());
-    if (res.color && options.shadows)
+    if (res.lighting && options.shadows)
         fitShadows(globals, *res.camera, items, tile);
 
     using render::Access;
@@ -157,7 +157,7 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
         d.read(res.globals.handle, Access::UniformRead);
         d.read(viewBuffer, Access::StorageRead);
     };
-    if (res.color && options.shadows)
+    if (res.lighting && options.shadows)
         graph.addPass(
             graph.reserve("shadow"),
             [&](render::FrameGraph::Declaration& d) { d.write(shadowMap, Access::DepthWrite); },
@@ -170,7 +170,7 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
     // 稳定几何按原有时序预留：它必须在时序解析之后、读回之前执行。
     if (res.stable)
         stableHandle = graph.reserve("geometry.stable");
-    if (res.color)
+    if (res.lighting)
         graph.addPass(
             graph.reserve("lighting"),
             [&](render::FrameGraph::Declaration& d)

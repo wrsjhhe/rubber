@@ -91,7 +91,7 @@ void PointsView::declare(FrameResources& res, FrameStats& stats)
     graph.bind(storage, *points->data());
     std::array<Image*, 5> geometry{res.albedo.image, res.normalRough.image, res.motion.image,
                                    res.metricDepth.image, res.instanceId.image};
-    auto* hdr = res.color ? res.hdr.image : nullptr;
+    auto* hdr = res.lighting ? res.hdr.image : nullptr;
     auto* depth = res.hardwareDepth.image;
 
     using render::Access;

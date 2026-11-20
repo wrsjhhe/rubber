@@ -87,16 +87,29 @@ glm::mat4 SensorCalibration::projection() const
     m[2][1] = 1 - 2 * cy / float(height);
     return m;
 }
-Observation::Observation(std::shared_ptr<FrameResult> result, SensorCalibration calibration, SampleTime time,
-                         std::vector<OutputInfo> outputs)
-    : frame(std::move(result)), calib(calibration), sample(time), infos(std::move(outputs))
+Observation::Observation(std::shared_ptr<FrameResult> result, SensorCalibration calibration, SampleTime time)
+    : frame(std::move(result)), calib(calibration), sample(time)
 {
     require(frame != nullptr, "Observation requires a frame result");
-    require(calib.width && calib.height && calib.fx > 0 && calib.fy > 0, "Invalid calibration");
+    // 标定必须自洽到能反算投影：尺寸非零、两轴焦距为正的有限值、主点有限、
+    // 近远平面有效。非法标定不能用来描述一次采样。
+    require(calib.width && calib.height, "Invalid calibration size");
+    require(std::isfinite(calib.fx) && calib.fx > 0 && std::isfinite(calib.fy) && calib.fy > 0,
+            "Invalid calibration intrinsics");
+    require(std::isfinite(calib.cx) && std::isfinite(calib.cy), "Invalid calibration principal point");
+    require(std::isfinite(calib.nearPlane) && calib.nearPlane > 0 && std::isfinite(calib.farPlane) &&
+                calib.farPlane > calib.nearPlane,
+            "Invalid calibration frustum");
     require(std::isfinite(sample.time), "Invalid sample time");
     require(std::isfinite(sample.duration) && sample.duration >= 0, "Invalid exposure duration");
     // 观测声明的是它真正采样过的时刻：与结果的帧时间不一致就拒绝，不做静默修正。
     require(sample.time == frame->time(), "Sample time does not match the frame");
+    // 输出描述只有这一个来源：调用方不能声明一个帧没有产出的通道，也不能虚报尺寸。
+    infos = frame->outputs();
+    require(!infos.empty(), "Observation requires a frame with at least one output");
+    for (const auto& info : infos)
+        require(calib.width == info.width && calib.height == info.height,
+                "Calibration size does not match the frame outputs");
 }
 double Observation::time() const
 {
@@ -135,6 +148,6 @@ ObservationResult Renderer::observe(const RenderRequest& request)
         return {};
     auto calibration = SensorCalibration::of(request.camera, request.view.width(), request.view.height());
     return {SubmitStatus::Submitted,
-            std::make_shared<Observation>(submission.frame, calibration, sample, submission.frame->outputs())};
+            std::make_shared<Observation>(submission.frame, calibration, sample)};
 }
 }

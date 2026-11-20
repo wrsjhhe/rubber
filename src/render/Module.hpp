@@ -50,7 +50,10 @@ struct FrameResources
     const PerspectiveCamera* camera = nullptr;
     VkDescriptorSet frameSet = VK_NULL_HANDLE;
     uint32_t width = 0, height = 0, shadowTile = 0;
-    bool color = false;   // 本次请求需要颜色链路
+    // 本帧是否产出光照结果（HDR）。它与"是否出 Beauty"不同：几何真值 + 调试通道的请求
+    // 也需要光照，因为 presentation 的 HDR 绑定是静态使用的、级联视图要读它的内容。
+    // 模块据此决定是否声明阴影与光照 pass、是否把 HDR 当颜色附件写。
+    bool lighting = false;
     bool stable = false;  // 需要一份不抖动的几何真值
 };
 // 本帧所有模块共享数据的存活凭据：GPU 完成前，资产与实例缓冲不能回收。

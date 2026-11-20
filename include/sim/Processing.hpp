@@ -23,6 +23,31 @@ struct DerivedOutput
     std::vector<uint8_t> bytes;
 };
 class ProcessingChain;
+// 阶段拿到的派生输出句柄：描述与布局只读，只有像素可写。名字、格式与尺寸由处理链按
+// 声明分配，阶段无法改写，因此"声明了 A 却交付成 B"在类型上就不成立。
+class DerivedPixels
+{
+  public:
+    const DerivedDesc& desc() const
+    {
+        return layout;
+    }
+    // 恰好是声明尺寸的像素：长度 = width * height * 每像素字节，行跨度 = width * 每像素字节。
+    std::span<uint8_t> bytes() const
+    {
+        return {pixels, count};
+    }
+
+  private:
+    friend class DerivedSink;
+    DerivedPixels(const DerivedDesc& declared, std::span<uint8_t> data)
+        : layout(declared), pixels(data.data()), count(data.size())
+    {
+    }
+    const DerivedDesc& layout;
+    uint8_t* pixels;
+    size_t count;
+};
 // 阶段写入句柄：按名字取自己声明的输出。未声明的名字、别人的产物、输入通道都不在这里。
 class DerivedSink
 {
@@ -31,7 +56,7 @@ class DerivedSink
     {
         return *source;
     }
-    DerivedOutput& write(std::string_view name);
+    DerivedPixels write(std::string_view name) const;
 
   private:
     friend class ProcessingChain;

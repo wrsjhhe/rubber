@@ -53,8 +53,11 @@ struct ChannelSemantic
 class Observation
 {
   public:
-    // 采样时刻与结果的帧时间不一致时拒绝构造：观测不能声明一个自己没采样的时刻。
-    Observation(std::shared_ptr<FrameResult>, SensorCalibration, SampleTime, std::vector<OutputInfo>);
+    // 输出描述取自结果本身，不接受调用方另给一份：这样 has()/read() 与实际交付
+    // 不可能各说一套。标定必须与结果尺寸一致、内参与近远平面必须有限且有效；
+    // 采样时刻必须等于结果的帧时间。焦距与主点的真值无法从结果反推，调用方负责
+    // 用真实相机参数构造（Renderer::observe 就是这么做的）。
+    Observation(std::shared_ptr<FrameResult>, SensorCalibration, SampleTime);
     const SensorCalibration& calibration() const
     {
         return calib;
