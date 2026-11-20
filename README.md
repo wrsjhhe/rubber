@@ -68,7 +68,7 @@ auto frame = view->read();
 
 ## 观测与处理链
 
-`observe()` 与 `submit()` 是同一次提交，额外带回这一帧的标定、采样时间与通道语义。观测只读，元数据与像素始终属于同一次采样：`sampleTime.time` 必须等于快照时间，否则拒绝构造。
+`observe()` 与 `submit()` 是同一次提交，额外带回这一帧的标定、采样时间与通道语义。观测只读，元数据与像素始终属于同一次采样：`sampleTime.time` 必须等于快照时间，输出描述直接取自结果本身（不接受另给一份清单），标定的尺寸必须与结果一致、内参与近远平面必须有限有效。焦距与主点的真值无法从结果反推，这一项由构造观测的调用方负责——`observe()` 用的就是真实相机参数。
 
 ```cpp
 sim::RenderRequest request{snapshot, camera, *view};
@@ -85,7 +85,7 @@ const float center = reinterpret_cast<const float*>(depth.bytes.data())[0];
 
 `ChannelSemantic` 给出每个通道的单位、定义、背景值以及它是否真值（不随曝光、抖动或调试呈现改变）。`observe()` 也接受 `RenderOptions::debugChannel`，但那只会产出 `Debug` 通道，不影响 `Color` 与 `Hdr`。
 
-处理链只读观测、只写自己声明的派生输出。与任何输入通道同名、全链重名、写入未声明的名字都会被整体拒绝，因此"处理"在结构上不可能覆盖真值通道：
+处理链只读观测、只写自己声明的派生输出。与任何输入通道同名、全链重名、写入未声明的名字都会被整体拒绝；阶段拿到的句柄只暴露只读描述与可写像素，改名、改尺寸、改格式在类型上不成立，因此"声明了 A 却交付成 B"没有入口：
 
 ```cpp
 struct InverseDepthStage : sim::SensorStage
@@ -100,9 +100,9 @@ struct InverseDepthStage : sim::SensorStage
     {
         const auto src = sink.input().read(sim::Channel::MetricDepth);
         const auto* z = reinterpret_cast<const float*>(src.bytes.data());
-        sim::DerivedOutput& dst = sink.write("inverse-depth");  // 未声明就抛错
-        auto* out = reinterpret_cast<float*>(dst.bytes.data());
-        for (size_t i = 0; i < dst.bytes.size() / sizeof(float); ++i)
+        auto dst = sink.write("inverse-depth");  // 未声明就抛错；返回的是只读描述 + 可写像素
+        auto out = dst.bytes();
+        for (size_t i = 0; i < out.size() / sizeof(float); ++i)
             out[i] = z[i] > 0 ? 1.0f / z[i] : 0.0f;
     }
 };
@@ -116,7 +116,7 @@ auto processed = chain.run(result.observation);  // 源观测仍可读，派生�
 
 `View::imageView(Channel)` 暴露由视图持有的 VkImageView。附件在 render 提交完成后可按 SHADER_READ_ONLY_OPTIMAL 读取。外部消费者应使用相同设备，协调提交与资源生命周期。当前 Renderer 的录制、提交和缓存接口按单线程调用设计；场景快照可由调用方在仿真步边界生成后移交给渲染线程。仅由 GPU 消费时可打开 stableGeometry，获得像素中心的几何通道。TAA 与几何真值同时启用时，为保证采样位置会额外录制一次无抖动的几何 pass。`View::activePasses()` 返回上一帧实际执行的 pass 名，可用来确认裁剪结果；`View::stationary()` 返回上一帧是否判为静止（相机、光照与所有模块输入都与上一帧相同），可据此判断渐进细化是否收敛；它只在真正写入颜色历史的帧上为真——几何真值请求、以及时序解析被裁掉的仅 Hdr 请求都不推进历史槽与各模块的历史基线。
 
-窗口要显示调试图时采样 `View::debugView()`，不要指望调试图出现在 `colorView()` 里：调试呈现是独立的 `presentation` pass，它写自己的图像，并把该 pass 声明为副作用根（只要请求了调试通道，这一帧就必定产出调试图）。`debugView()` 在未请求调试通道的帧上返回空句柄。
+窗口要显示调试图时采样 `View::debugView()`，不要指望调试图出现在 `colorView()` 里：调试呈现是独立的 `presentation` pass，它写自己的图像，并把该 pass 声明为副作用根（只要请求了调试通道，这一帧就必定产出调试图）。`debugView()` 在未请求调试通道的帧上返回空句柄。此外，只要选了调试通道就必须有光照结果——`presentation` 的 HDR 描述符是静态使用的，级联视图还要读它的内容——所以"只请求几何真值 + 调试通道"的帧也会跑一次光照，但不建显示图与历史槽，也不做时序解析与颜色变换。
 
 | 通道 | 格式与语义 |
 |---|---|

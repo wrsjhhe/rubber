@@ -71,6 +71,7 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 - 标定与出图同源：`SensorCalibration::of(camera, width, height)` 在有内参时取 `camera.fx/fy/cx/cy`，否则由垂直视场角按方形像素换算；`projection()` 复用与 `PerspectiveCamera::projection` 完全相同的构造路径——`glm::perspectiveRH_ZO` 给出 P00/P11 后乘以 y 轴翻转，再把内参重写入 P00/P11/P20/P21（`2fx/w`、`-2fy/h`、`1-2cx/w`、`1-2cy/h`）。`Globals::lens` 里的焦距也取自同一组参数。三者同源是"标定可用于反投影"的前提；写成两份就会随改动漂移。
 - 采样时间是元数据，不是积分器：`SampleTime{time, duration}` 的 `time` 必须等于快照时间，`duration` 是曝光时长（0 表示瞬时），`end() = time + duration` 供下游描述曝光区间。当前渲染器按瞬时采样出图，曝光积分属 F12，因此 `duration` 只影响观测元数据，不影响像素。
 - 观测只读且不可覆盖真值：`read(Channel)` 与 `FrameResult::read` 同语义，未请求的通道显式报错而不补零；`semantic(Channel)` 给出该通道的单位、定义与背景值，供下游判断自己拿到的是什么。
+- 元数据不能与帧矛盾：`Observation` 的输出描述**只取自 `FrameResult::outputs()`**，不接受调用方另给一份清单，因此 `has()`/`read()` 与实际交付不可能各说一套；标定的 `width/height` 必须等于每个输出描述的尺寸，`fx/fy` 必须是正的有限值、主点有限、近远平面有效，采样时刻必须等于结果帧时间。焦距与主点的真值无法从结果反推，这一项由构造观测的调用方负责（`observe()` 用真实相机参数）；能验证的矛盾一律拒绝。
 
 ## 呈现隔离与处理链
 
@@ -79,8 +80,8 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 - `lighting.frag` 只输出 Beauty，`color.frag` 无条件做曝光+ACES+sRGB 编码，因此 `Hdr`/`Resolved`/`Color` 三条输出与是否选了调试通道无关。
 - `presentation.frag` 读 G-buffer（`normalTex`、`metricTex`、`idTex`）与 HDR（级联分区要看光照结果才能画分区色），按 `frame.settings.w` 选通道，写自己的 `debug` 图；背景为 0，最后统一做 sRGB 编码。
 - `recordPresentation()` 只提交一个全屏三角形，`View::debugView()` 与 `Channel::Debug` 暴露的是同一张图。窗口要显示诊断就采这份图，而不是把调试写进 Beauty。
-- 帧图侧有两个必须写对的细节。其一，**声明必须覆盖描述符可访问的资源**：`debugSet` 在创建时就绑定了 HDR，即使当前调试通道不读它，着色器也可以读到，因此 `presentation` pass 总是声明 `read(hdrImage)`——否则"只请求 Debug"的帧会把光照裁掉、HDR 停在 UNDEFINED，验证层报 `VUID-vkCmdDraw-None-09600`。其二，`presentation` 不是导出根（`Color` 才是），在旧 `render()` 路径下没有导出根时会被裁掉，窗口采样的调试图从未被写入；所以选了调试通道就把该 pass 声明为 `sideEffect()` 根，保证这一帧必定产出调试图。这两条都不是"多写一行保险"，而是描述符绑定与裁剪根语义的直接推论。
-- 处理链是"只能新增"的协议：`SensorStage::outputs()` 声明本阶段新增的派生输出，`SensorStage::process(DerivedSink&)` 只通过 `sink.input()` 读观测、`sink.write(name)` 取自己声明的输出，`write()` 对未声明的名字直接抛 "Stage wrote an undeclared output"。`ProcessingChain::run` 在执行任何阶段之前做全链校验：空名、零尺寸、`desc.name == Observation::semantic(channel).name`（会遮蔽输入通道）、全链重名，任一命中就整体拒绝，不留半成品输出。因此"处理器覆盖真值"在结构上不可能发生，不需要靠约定或代码评审守。`ProcessedObservation` 同时持有源观测和派生输出，调用方读派生数据时源结果仍然有效。
+- 帧图侧有三个必须写对的细节。其一，**声明必须覆盖描述符可访问的资源**：`debugSet` 在创建时就绑定了 HDR，即使当前调试通道不读它，着色器也可以读到，因此 `presentation` pass 总是声明 `read(hdrImage)`——否则"只请求 Debug"的帧会把光照裁掉、HDR 停在 UNDEFINED，验证层报 `VUID-vkCmdDraw-None-09600`。其二，`presentation` 不是导出根（`Color` 才是），在旧 `render()` 路径下没有导出根时会被裁掉，窗口采样的调试图从未被写入；所以选了调试通道就把该 pass 声明为 `sideEffect()` 根，保证这一帧必定产出调试图。其三，**选了调试通道就要把光照带进规划**：HDR 的绑定是静态使用、级联视图还真的采样它，因此资源规划用 `lighting = 需要颜色 || debugChannel != 0`，而不是"需要颜色"——否则"只请求几何真值 + 调试通道"的帧会去引用一张没导入的 HDR 图（`graph.read` 直接抛 unknown image），或者采样到未定义内容。`FrameResources` 因此把"是否产出光照"（`lighting`）与"是否出 Beauty"分成两件事：模块据前者决定声明阴影与光照 pass、把 HDR 当第六个颜色附件写，据后者之外的一切由调度侧处理。这三条都不是"多写一行保险"，而是描述符绑定、裁剪根与资源规划的直接推论。
+- 处理链是"只能新增"的协议：`SensorStage::outputs()` 声明本阶段新增的派生输出，`SensorStage::process(DerivedSink&)` 只通过 `sink.input()` 读观测、`sink.write(name)` 取自己声明的输出。`write()` 返回 `DerivedPixels`——**描述只读、像素可写**——名字、格式与尺寸由处理链按声明分配，阶段改不到，所以"声明了 A 却交付成 B"在类型上就不成立（`tests/observation_check.cpp` 用 `static_assert` 锁住返回类型）。`ProcessingChain::run` 在执行任何阶段之前做全链校验：空名、零尺寸、`desc.name == Observation::semantic(channel).name`（会遮蔽输入通道）、全链重名，任一命中就整体拒绝，不留半成品输出。行跨度与总长按 64 位计算并检查 `row > UINT32_MAX`：接口里的 `rowBytes` 是 `uint32_t`，按 32 位相乘会让巨大宽度回绕成很小的数，分配出的缓冲比声明的小、阶段按声明去写就越界。阶段全部返回后再复核一遍描述、行跨度与数据长度仍与声明一致。`ProcessedObservation` 同时持有源观测和派生输出，调用方读派生数据时源结果仍然有效。
 - 未实现的阶段（畸变、曝光积分、运动模糊、噪声）按同一协议接入，不改变上述约束；它们目前都是缺项，不列为已支持。
 
 ## 验证与性能

@@ -1,5 +1,21 @@
 # 实现进度
 
+## 最新状态（2026-11-20 / M5 修复 428d264，待复审）
+
+**R-M5-001/002/003 已修复，待复审。** 三项的根因都是"契约只在文档里，代码路径没有围栏"，修法都落在结构上而不是加判断：
+
+1. **几何-only + 调试通道**：`presentation` 的 HDR 绑定是静态使用的、级联视图还真的采样它，所以"选了调试通道"本身就是光照依赖，不能等声明时才引用一张按 `color` 决定是否导入的图。资源规划改为 `lighting = 需要颜色 || debugChannel != 0`，`FrameResources` 把"是否产出光照"（`lighting`）与"是否出 Beauty"分开：几何-only + 调试通道的帧会跑光照、产出 HDR、写调试图，但不建显示图与历史槽，也没有时序解析与颜色变换。HDR 在 `lighting` 为真时一并 `restoreImage`，避免物理布局与视图记录的布局分叉。
+2. **派生输出可绕过声明检查**：`DerivedSink::write` 不再返回可变的 `DerivedOutput&`，而是 `DerivedPixels`——描述只读、像素可写。改名、改尺寸、改格式在类型上不成立（`static_assert` 锁住返回类型）。分配时行跨度与总长按 64 位计算并检查 `row > UINT32_MAX`（`rowBytes` 是 `uint32_t`，32 位相乘会把巨大宽度回绕成很小的数）；阶段全部返回后再复核描述、行跨度与数据长度仍与声明一致。
+3. **观测元数据可能与帧矛盾**：`Observation` 的输出描述只取自 `FrameResult::outputs()`，不接受调用方另给一份清单；标定尺寸必须等于每个输出的尺寸，`fx/fy` 为正有限值、主点有限、近远平面有效。焦距与主点无法从结果反推，这一项明确由调用方负责（`observe()` 用真实相机参数），能验证的矛盾一律拒绝。
+
+本轮验证：Release 构建通过；八项 CTest 全通过；七项设备测试 `--validation` 各 0 条校验错误；`gallery --smoke --validation` 与 `--capture m5fix-capture.png --validation` 退出 0、0 条，捕获图与 `example/preview/courtyard.png` 差异仍为 37472/4096000（0.915%）、`max_delta=1`，且与上一轮 `m5-capture.png` **逐字节相同**（修复没有改动默认画面）；`temporal_check` 数值逐位不变（328 个轮廓像素 raw=4.78522、TAA=1.23697，运动 105.933/62.5146）。
+
+四处置信核对均先失败后还原：把 `lighting` 退回 `color` → “Frame graph read of an unknown image”（正是审核报告的 P1）；去掉行跨度溢出检查 → “Chain allocated a derived output whose stride overflows 32 bits”；去掉标定尺寸一致性校验 → “Observation accepted a calibration that does not match the frame”；把 `DerivedPixels::desc()` 改成返回可变引用 → 编译直接失败（`const DerivedDesc` 无法转成 `DerivedDesc&`），说明改名这条攻击面属于类型约束而不是运行时校验。
+
+## 最新独立审核（2026-11-20 / 3924da5）
+
+**M5 需修改，尚未验收。** 独立 Release、八项 CTest、七项 --validation、Gallery smoke 通过；发现几何-only + debugChannel 引用未导入 HDR、派生描述可绕过声明校验、Observation 允许帧与元数据矛盾三项问题。详见 [M5 审核报告](REVIEW_M5.md)。本结论优先于下方开发者待审核记录。
+
 ## 最新状态（2026-11-20 / M5 3924da5，待审核）
 
 **M5 已实现，待审核。** 观测与呈现从渲染核心里分出来：`include/sim/Observation.hpp` 定义标定、采样时间、通道语义与只读观测，`include/sim/Processing.hpp` 定义处理链入口，`src/sensors` 实现两者，`src/presentation` 提供调试呈现。呈现隔离的做法是把调试通道从光照里彻底移除：`lighting.frag` 只输出 Beauty，新的 `presentation.frag` 读 G-buffer（与级联视图需要的 HDR）写一张独立的 `debug` 图，窗口采样 `View::debugView()`，`Channel::Debug` 交付的是同一张图。因此同一帧既能看到真实颜色，也能看到调试通道，HDR 与时序历史里只有 Beauty。
@@ -103,7 +119,7 @@ Release、四项 CTest、asset_check --validation、Gallery smoke 独立通过�
 | F02 缓存拆分 | 已验收（278371f）；render/RenderScene.hpp、render/RenderScene.cpp、assets/AssetCache.hpp、backend/Device.hpp、tests/asset_check.cpp | 场景准备仍在调用线程录制；实例缓冲按快照版本重新分配，未跨版本复用；上传批未限流 |
 | F07 帧图 | 已有实现，待审核；render/graph/FrameGraph.hpp、FrameGraph.cpp、tests/graph_check.cpp | 单队列顺序执行；保守屏障（每 pass 保守 stage/access，不做合并优化）；瞬时资源按描述缓存复用，未做显存别名。`readWrite` 的附件屏障按读改写补 `COLOR_ATTACHMENT_READ`，由 graph_check 断言；`executed(PassHandle)` 暴露编译后的裁剪结果，供调度侧判断跨帧副作用是否真的发生 |
 | F08 模块与点云 | 已有实现，待审核；render/Module.hpp、modules/mesh、modules/points、shaders/points.vert、shaders/points.frag、render/passes/PointsPass.cpp、tests/points_check.cpp | 点云不在 CPU 侧剔除，也不参与阴影投射；无逐点历史，运动向量写零（运动分支不复用旧像素），静止冻结靠每视图的颜色历史基线失效；点云仍需按节点逐点展开到一份共享缓冲，总量受 `maxStorageBufferRange` 限制，上传批暂存未主动回收；gallery 示例场景尚未加入点云。颜色历史基线（网格姿态与点云身份）只经 `ModuleView::commitHistory(true)` 推进，未写入历史的帧（仅 Hdr、几何真值）不改变基线 |
-| F09 观测与呈现 | 已有实现，待审核；include/sim/Observation.hpp、include/sim/Processing.hpp、src/sensors、src/presentation、shaders/presentation.frag、tests/observation_check.cpp | 标定与投影一致、采样时刻等于快照时间、通道语义表与十个通道一一对应；调试图写独立图像，Beauty/HDR 不受影响；处理链只读观测、只写自己声明的派生输出。曝光时长只是元数据（F12 才积分曝光），无畸变/噪声/运动模糊阶段，处理链只在 CPU 侧按通道字节工作，未接入 GPU 阶段 |
+| F09 观测与呈现 | 已有实现，待复审（R-M5-001/002/003 已修复）；include/sim/Observation.hpp、include/sim/Processing.hpp、src/sensors、src/presentation、shaders/presentation.frag、tests/observation_check.cpp | 标定与投影一致、采样时刻等于快照时间、输出描述取自结果本身且尺寸/内参/近远平面自校验、通道语义表与十个通道一一对应；调试图写独立图像，Beauty/HDR 不受影响，几何-only + 调试通道同样产出调试图（该帧会跑光照，但不建显示图与历史槽）；处理链只读观测、只写自己声明的派生输出，句柄只暴露只读描述与可写像素。曝光时长只是元数据（F12 才积分曝光），无畸变/噪声/运动模糊阶段，处理链只在 CPU 侧按通道字节工作，未接入 GPU 阶段 |
 | F10 | 待开发 | 无 install/export/find_package 验证 |
 | F11—F17 | 未实现 | 后续规划，不列为已支持 |
 
@@ -117,12 +133,14 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 | M2 | M1；已验收（278371f） | RenderScene、共享静态实例数据、不可变资产版本、上传依赖、延迟回收 | asset_check：同快照两相机准备与上传各一次、旧快照在原对象被修改后与清缓存后仍重现原画面、身份不复用、静止收敛后换贴图的 Color 更新、上传批与暂存回落、旧代际最终回收、渲染输入只读的编译期断言 |
 | M3 | M2；已验收（715233d） | 帧图及六类独立 pass，资源声明与分配分离 | graph_check：裁剪、未初始化读取（图像与缓冲逐区间，含"局部写+整体覆写"合并路径）、同 pass 读写冲突、循环依赖、子资源精确展开、缓冲分段导出与生产者、跨子资源/跨区间 RAW/WAR/WAW、分段读后覆写的每段屏障源状态、usage 诊断、导出终态；pass_check：按输出通道断言活跃 pass 清单（含首帧历史清除与状态变化后的重建）；六项 CTest 与五项 --validation |
 | M4 | M3；已验收（d3c0c1f） | 网格模块迁移、模块协议、点云 | points_check：同一快照两台相机下点在前/网格在前的遮挡互换、米制深度与实例标签取值、仅点云场景、点云 pass 相对网格 pass 的插入位置、强度→亮度与半径→覆盖互不影响、覆盖面积随分辨率平方增长；相同距离下俯仰/翻滚不改变覆盖、`fx != fy` 时足迹为椭圆；静止收敛后移动/删除/改强度的 Color 刷新、两相机各自的历史基线、几何真值交付不推进颜色基线；Hdr-only（关闭 TAA，时序解析被裁掉）不推进颜色历史与阈值基线、连续穿插 Hdr-only 不扰动颜色链路、网格移动 + Hdr-only 后颜色帧仍刷新。graph_check：读改写附件的 dstAccess 含读与写、普通覆盖写不含读。七项 CTest 与六项 --validation |
-| M5 | M4；已有实现，待审核 | Observation、处理链入口、呈现隔离、互操作边界 | observation_check：标定反算的投影与渲染器一致（内参与视场角两条路径）、采样时刻必须等于快照时间（错时刻与负曝光被拒）、曝光区间作为元数据保留；同一帧 `{Color, Hdr, Debug}` 的 Beauty 与 HDR 逐字节等于不带调试的对照帧，调试图与 Beauty 不同且背景为零；只请求 Debug/Color 与级联通道同样不污染 Beauty，未选调试通道时请求 Debug 显式报错；Debug 的 GPU 交付与 `View::debugView()` 可用；曝光×4 + 调试通道 + TAA 抖动下米制深度与实例标签逐字节不变，而颜色改变；处理链的派生输出按输入通道计算、源观测真值不变，与通道同名/写未声明名字都被拒绝。pass_check：Resolved 交付的活跃清单、Debug 请求新增 presentation 且稳定几何副本进入清单、重复调试帧不再清除历史。八项 CTest 与七项 --validation |
+| M5 | M4；已有实现，待复审（R-M5-001/002/003 已修复） | Observation、处理链入口、呈现隔离、互操作边界 | observation_check：标定反算的投影与渲染器一致（内参与视场角两条路径）、采样时刻必须等于快照时间（错时刻与负曝光被拒）、曝光区间作为元数据保留、错尺寸标定/非有限内参/空视锥被拒、输出清单等于请求且未请求通道读不出；同一帧 `{Color, Hdr, Debug}` 的 Beauty 与 HDR 逐字节等于不带调试的对照帧，调试图与 Beauty 不同且背景为零；只请求 Debug/Color 与级联通道同样不污染 Beauty，未选调试通道时请求 Debug 显式报错；Debug 的 GPU 交付与 `View::debugView()` 可用；曝光×4 + 调试通道 + TAA 抖动下米制深度与实例标签逐字节不变，而颜色改变；处理链的派生输出按输入通道计算、源观测真值不变，与通道同名/全链重名/写未声明名字都被拒绝，行跨度溢出 32 位在分配前被拒且阶段未执行；几何-only + 每种 debugChannel（1—4）在不请求 Debug 的情况下仍产出调试图，活跃清单含 `lighting`+`presentation`、不含 `temporal`/`color`，几何真值逐字节等于对照帧，GPU 交付路径同样成立。pass_check：Resolved 交付的活跃清单、Debug 请求新增 presentation 且稳定几何副本进入清单、重复调试帧不再清除历史。八项 CTest 与七项 --validation |
 | M6 | M5；待开发 | 安装头文件/库/shader、导出 target/依赖 | 新安装前缀的外部项目 find_package 构建并离屏运行，不访问原源码/构建目录；关闭 example 可构建 |
 
 每项保留现有回归。F11—F17 分别立项，先补规格和质量/性能门槛。
 
 ## 已有验证与缺口
+
+本轮（M5 修复）：Release 构建成功；八项 CTest 全通过；七项 `--validation` 各 0 条；`gallery --smoke --validation` 与 `--capture m5fix-capture.png --validation` 退出 0、0 条，捕获图与参考图差异 37472/4096000（0.915%）、`max_delta=1`，与 `m5-capture.png` 逐字节相同；`temporal_check` 数值逐位不变。新增用例覆盖审核者点名的确切组合：几何-only 请求（不含 Debug 输出）+ `debugChannel` 1—4、几何真值的 CPU 与 GPU 交付、处理链的行跨度溢出与全链重名、观测的错尺寸标定/非有限内参/空视锥。四处置信核对：`lighting` 退回 `color` → “Frame graph read of an unknown image”；去掉溢出检查 → “Chain allocated a derived output whose stride overflows 32 bits”；去掉标定尺寸校验 → “Observation accepted a calibration that does not match the frame”；把描述句柄改为可变 → 编译失败（`const DerivedDesc` 不能转成 `DerivedDesc&`）。
 
 本轮（M5）：Release 构建成功；八项 CTest 全通过（新增 observation_check）；七项设备测试各以 `--validation` 运行均 0 条；gallery `--smoke --validation`（含调试通道切换与纹理重绑）与 `--capture m5-capture.png --validation` 退出 0、0 条；捕获图与 `example/preview/courtyard.png` 差异 37472/4096000（0.915%）、`max_delta=1`，且与上一轮 `m4history-capture.png` 逐字节相同，说明呈现隔离没有改动网格路径的画面。temporal_check 的度量改为 Resolved（线性），只统计 328 个轮廓像素：raw=4.78522、TAA=1.23697，运动 105.933/62.5146；旧口径（诊断通道的 sRGB 值）随调试呈现独立而失效。七处缺陷注入均先失败后还原，其中"去掉 presentation 副作用根"由 gallery 冒烟的 4 条 `VUID-vkCmdDraw-None-09600` 捕获。新用例首次执行还暴露出两处真缺陷（描述符绑定 HDR 但未声明读取导致 09600、旧 render 路径下调试图被裁），已修复。
 
@@ -144,9 +162,41 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 
 尚缺显存分配自动统计证据、多队列/异步计算路径、显存别名复用，以及安装测试。点云已由 points_check 覆盖单点数据、双相机遮挡、仅点云场景、两种分辨率、强度/半径语义、相机姿态与双轴内参下的足迹、静止收敛后移动/删除/改强度与几何真值帧的颜色刷新，以及 Hdr-only 与穿插 Hdr-only 帧的历史提交条件；尚未覆盖大规模点云、逐点运动、阴影投射与上传批暂存回收。活跃 pass 清单已由 pass_check 按输出通道逐项断言，但只覆盖本仓库现存的通道组合，未覆盖全部请求×交付×选项组合。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。
 
-M5 新增缺项：处理链只有 CPU 侧按通道字节实现的 `SensorStage`，尚未接入 GPU pass，"阶段"与帧图资源没有绑定关系；`SampleTime::duration` 只是元数据，曝光积分、运动模糊与卷帘快门都未实现，因此 `end()` 与 `time()` 的差在下游还没有可观察效果。`SensorCalibration` 只描述针孔投影与近远平面，没有畸变系数、主点单位以外的像素宽高比、也没有与真实传感器模型对齐的量化/噪声项。`Channel::Resolved` 的 A 分量是本帧米制深度，`Channel::Hdr` 的 A 分量是覆盖率，两者语义不同但都编码在 alpha 里，尚未在类型上区分；调试通道只覆盖 12 个组合（三档调试通道 × 是否级联 × 是否 TAA，实际断言 4 条主路径），宽高比非 1 的窗口与超宽视野下的调试图未单独验证。呈现隔离只对 Color/HDR/Debug 三条输出证明互不覆盖，`Resolved` 与 `Debug` 同时请求时的活跃清单由 pass_check 覆盖，但"同帧同时读 Resolved 与 Debug 且带 TAA"未加断言。观测结果与处理链都按值拷贝通道字节，大分辨率下的额外拷贝开销未测量。
+M5 新增缺项：处理链只有 CPU 侧按通道字节实现的 `SensorStage`，尚未接入 GPU pass，"阶段"与帧图资源没有绑定关系；`SampleTime::duration` 只是元数据，曝光积分、运动模糊与卷帘快门都未实现，因此 `end()` 与 `time()` 的差在下游还没有可观察效果。`SensorCalibration` 只描述针孔投影与近远平面，没有畸变系数、主点单位以外的像素宽高比、也没有与真实传感器模型对齐的量化/噪声项；焦距与主点的真值无法从帧反推，只能由调用方负责，观测只拒绝可验证的矛盾（尺寸、通道、有限性与视锥）。`Channel::Resolved` 的 A 分量是本帧米制深度，`Channel::Hdr` 的 A 分量是覆盖率，两者语义不同但都编码在 alpha 里，尚未在类型上区分。调试通道已覆盖 1—4 四档（含几何-only 与颜色链路两条路径），宽高比非 1 的窗口与超宽视野下的调试图仍未单独验证；调试图的内容断言只到"背景为零、物体处非零"，没有逐像素参考。派生输出的句柄把改名/改尺寸变成编译错误，但绕过方式（`const_cast`、越界写像素）不在类型系统的保护范围内，也没有运行时守卫。呈现隔离只对 Color/HDR/Debug 三条输出证明互不覆盖，`Resolved` 与 `Debug` 同时请求时的活跃清单由 pass_check 覆盖，但"同帧同时读 Resolved 与 Debug 且带 TAA"未加断言。观测结果与处理链都按值拷贝通道字节，大分辨率下的额外拷贝开销未测量。
 
 ## 交接记录
+
+### M5 修复 / F09（回应 REVIEW_M5：R-M5-001/002/003）
+
+任务编号 / 功能编号：M5 / F09，审核问题 R-M5-001（P1）、R-M5-002（P2）、R-M5-003（P2）
+负责人 / 日期 / 状态：开发者 / 2026-11-20 / 待复审
+代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支 428d264（接 3924da5/80a8613）
+修改文件 / 接口变化：
+- `src/render/Renderer.cpp`：`renderFrame` 用 `lighting = color || o.debugChannel != 0` 决定是否 `ensureColor()` 与导入 `hdr`；HDR 的导入与 `restoreImage` 跟随 `lighting`，显示图/历史槽/时序解析/颜色变换仍跟随 `color`；`FrameResources` 填充 `res.lighting`
+- `src/render/Module.hpp`：`FrameResources::lighting`（本帧是否产出光照）；删除不再有人读的 `color` 字段
+- `src/modules/mesh/MeshModule.cpp`、`src/modules/points/PointsModule.cpp`：阴影/光照/HDR 附件的判据从 `res.color` 改为 `res.lighting`
+- `include/sim/Processing.hpp`：新增 `DerivedPixels`（只读 `desc()`、可写 `bytes()`）；`DerivedSink::write` 返回它而不是可变的 `DerivedOutput&`
+- `src/sensors/Processing.cpp`：`write()` 返回句柄；行跨度与总长按 64 位计算并检查 `row > UINT32_MAX`；阶段返回后复核描述、行跨度与数据长度
+- `include/sim/Observation.hpp`、`src/sensors/Observation.cpp`：`Observation` 构造改为 `(frame, calibration, sampleTime)`，输出描述只取自 `FrameResult::outputs()`；新增标定尺寸一致性、有限内参与有效视锥校验
+- `tests/observation_check.cpp`：新增几何-only + 每种 debugChannel 的 CPU/GPU 交付、溢出与重名拒绝、观测元数据伪造被拒、`DerivedPixels` 返回类型的 `static_assert`
+已完成：
+- R-M5-001：`presentation` 的 HDR 依赖进入资源规划。几何-only 请求（输出里没有 Debug）+ `debugChannel` 1—4 的帧会跑光照、产出 HDR、写调试图，活跃清单为 `geometry`→`lighting`→`presentation`，既不含 `temporal` 也不含 `color`；交付的米制深度与实例标签与不带调试通道的对照帧逐字节相同，CPU 与 GPU 两种交付路径都验证
+- R-M5-002：派生输出句柄只暴露只读描述与可写像素，改名/改尺寸/改格式在类型上不成立（`observation_check` 用 `static_assert` 锁住）；分配前的 64 位行跨度检查拒绝 `0x40000001` 宽的 Rgba16Float 声明且阶段不执行；全链重名、与输入通道同名、写未声明名字仍在执行前整体拒绝
+- R-M5-003：观测的输出清单等于帧的实际输出（不再接受外部清单），错尺寸标定、非有限 `fx`、空视锥都被拒；未请求通道 `read()` 显式报错
+仍缺项：
+- 焦距与主点的真值无法从帧反推，只能由调用方负责；观测只拒绝可验证的矛盾
+- 派生句柄的绕过方式（`const_cast`、像素越界写）不在类型系统保护范围内，也没有运行时守卫
+- 沿用上一轮：处理链只有 CPU 侧实现、曝光时长只是元数据、标定无畸变与噪声、`Resolved`/`Hdr` 的 alpha 语义复用、宽高比非 1 的窗口未验证；点云上传在图外、暂存未回收；单队列顺序执行、屏障保守
+环境 / 精确构建测试命令：Windows、Visual Studio 2022 x64、Vulkan SDK 1.4.357.0、RTX 3080 Ti
+- `cmake --build build-dev --config Release`
+- `ctest --test-dir build-dev -C Release --output-on-failure`
+- `sensor_check|temporal_check|request_check|asset_check|pass_check|points_check|observation_check --validation`
+- `gallery --capture build-dev/m5fix-capture.png --validation`；`gallery --smoke --validation`
+结果 / 日志截图位置：八项 CTest 全通过；七项 `--validation` 与 gallery 均 0 条；捕获图与参考图差异 37472/4096000（0.915%）、`max_delta=1`，与 `m5-capture.png` 逐字节相同；`temporal_check` 数值逐位不变
+缺陷注入核对：四处——`lighting` 退回 `color` → “Frame graph read of an unknown image”；去掉行跨度溢出检查 → “Chain allocated a derived output whose stride overflows 32 bits”；去掉标定尺寸校验 → “Observation accepted a calibration that does not match the frame”；`DerivedPixels::desc()` 改为返回可变引用 → 编译失败（`const DerivedDesc` 无法转成 `DerivedDesc&`）
+性能和画质对比：未做性能测量；几何-only + 调试通道的帧多跑一次光照与一次全屏呈现，不分配显示图与历史槽；不选调试通道的帧规划与之前完全一致（捕获图逐字节相同）
+已知问题 / 下一步：等待复审；通过后进入 M6（安装头文件/库/shader、导出 target 与依赖）
+审核人 / 审核版本 / 结论 / 问题编号：待填
 
 ### M5 / F09 观测、处理链入口与呈现隔离
 
