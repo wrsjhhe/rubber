@@ -12,16 +12,20 @@ struct Vertex
     glm::vec3 position, normal;
     glm::vec2 uv;
 };
+// 资产身份：对象构造时分配、进程内不复用。渲染缓存以身份而非地址区分对象，
+// 释放后的地址被新对象复用时不会错误命中旧 GPU 数据。
+using AssetId = uint64_t;
+AssetId nextAssetId();
 class BufferGeometry
 {
   public:
     BufferGeometry(std::vector<Vertex> vertices, std::vector<uint32_t> indices);
+    // 顶点与索引发布后不可变，改变几何只能创建新对象；旧快照因此始终能看到
+    // 当初提交的内容，缓存切换代际后也能按同一份 CPU 数据重新上传。
     const std::vector<Vertex> vertices;
     const std::vector<uint32_t> indices;
+    const AssetId id = nextAssetId();
     glm::vec3 minimum{}, maximum{};
-    // 内容版本。几何发布后按不可变资产使用；改变内容必须递增版本，
-    // 渲染缓存以“对象身份 + 版本”为键，旧快照继续持有旧版本。
-    uint64_t revision = 1;
 };
 using Geometry = std::shared_ptr<const BufferGeometry>;
 Geometry BoxGeometry(float width = 1, float height = 1, float depth = 1);
@@ -34,12 +38,16 @@ Geometry ConvexGeometry(const std::vector<glm::vec3>& points);
 
 struct Texture
 {
-    uint32_t width, height;
-    std::vector<uint8_t> rgba;
-    // 内容版本，语义同 BufferGeometry::revision。
-    uint64_t revision = 1;
+    Texture(uint32_t width, uint32_t height, std::vector<uint8_t> pixels);
+    // 像素发布后不可变。复制得到的对象内容逐字节相同，因此共享同一身份也不会
+    // 产生歧义；改变贴图内容只能创建新对象。
+    const uint32_t width, height;
+    const std::vector<uint8_t> rgba;
+    const AssetId id = nextAssetId();
     static std::shared_ptr<const Texture> load(const std::filesystem::path& path);
 };
+// 材质是值类型：加入场景时按值复制，快照保存的是当时的内容。
+// 之后修改用户手中的原对象不会改变已发布的快照，新快照才会带出新值。
 struct MeshStandardMaterial
 {
     glm::vec3 color{0.8f};
@@ -47,14 +55,13 @@ struct MeshStandardMaterial
     float metalness = 0;
     glm::vec2 uvRepeat{1};
     std::shared_ptr<const Texture> map, normalMap, metalRoughMap;
-    // 内容版本。原地修改上述字段后递增版本，缓存才会重建材质与贴图绑定。
-    uint64_t revision = 1;
+    bool operator==(const MeshStandardMaterial&) const = default;
 };
 struct Mesh
 {
     uint32_t id;
     Geometry geometry;
-    std::shared_ptr<const MeshStandardMaterial> material;
+    MeshStandardMaterial material;
     glm::mat4 world{1};
     bool castsShadow = true;
 };
@@ -80,7 +87,7 @@ class Object3D
   public:
     glm::mat4 local{1};
     Geometry geometry;
-    std::shared_ptr<const MeshStandardMaterial> material;
+    MeshStandardMaterial material;
     bool castsShadow = true;
     uint32_t id() const
     {
@@ -102,6 +109,9 @@ class Scene
     std::vector<PointLight> lights;
     uint32_t add(Geometry geometry, std::shared_ptr<const MeshStandardMaterial> material,
                  glm::mat4 local = glm::mat4(1), uint32_t parent = 0);
+    // 直接按值挂载，用于把一份快照里的材质原样搬到另一个场景。
+    uint32_t add(Geometry geometry, const MeshStandardMaterial& material, glm::mat4 local = glm::mat4(1),
+                 uint32_t parent = 0);
     uint32_t addGroup(glm::mat4 local = glm::mat4(1), uint32_t parent = 0);
     Object3D& get(uint32_t id);
     void remove(uint32_t id);

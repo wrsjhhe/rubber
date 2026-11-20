@@ -10,7 +10,7 @@
 |---|---|---|
 | include/sim | 应用接口、结果、模块协议 | 原生 Vulkan 访问放独立互操作头 |
 | src/scene | 节点、变换、ID、可见性、包围盒、类型批次快照 | GPU 分配与窗口 |
-| src/assets | 导入、资产身份/版本和缓存 | 每相机历史 |
+| src/assets | 导入、资产身份和缓存 | 每相机历史 |
 | src/backend | Vulkan 设备、内存、上传、命令与同步 | 场景类型业务分支 |
 | src/render | RenderScene、View、FrameContext 和请求编排 | 所有模块上传/绘制内联在主调度 |
 | src/render/graph | 声明资源、依赖编译、转换、生命周期 | 材质与点云算法 |
@@ -24,8 +24,8 @@
 
 ## 所有权
 
-- Scene 由应用修改；SceneSnapshot 固定实例、灯光、时间和不可变资产引用。
-- AssetCache 按身份/版本缓存；清理只移除缓存引用，未完成提交仍保活资产。
+- Scene 由应用修改；SceneSnapshot 固定实例、灯光、时间和不可变资产引用，并按值保存材质。
+- AssetCache 按资产身份缓存几何与贴图、按内容缓存材质；身份构造时分配且不复用。清理只移除缓存引用，未完成提交仍保活资产。
 - RenderScene 持有共享 GPU 数据及上传依赖；不能放某台相机的 oldModel。
 - View 持有分辨率、相机相关状态、历史注册表和失效版本。
 - FrameContext 持有当次帧槽、命令和临时资源，安全完成后回收。

@@ -18,11 +18,12 @@ RenderScene::RenderScene(Device& d, const std::shared_ptr<AssetCache>& cache, co
     std::unordered_set<uint32_t> ids;
     for (auto& mesh : snapshot.meshes)
     {
-        if (!mesh.geometry || !mesh.material || !mesh.id)
+        if (!mesh.geometry || !mesh.id)
             throw std::invalid_argument("Invalid snapshot mesh");
         if (!ids.insert(mesh.id).second)
             throw std::invalid_argument("Duplicate snapshot mesh ID");
-        auto& material = *mesh.material;
+        // 快照里的材质已经是值副本，这里直接按该值写实例数据并准备 GPU 资产。
+        auto& material = mesh.material;
         SceneInstance instance{
             mesh.world,
             {material.color, material.roughness},
@@ -51,8 +52,7 @@ bool RenderScene::matches(const SceneSnapshot& scene) const
         auto& item = draws[i];
         if (mesh.id != item.id || mesh.castsShadow != item.castsShadow || mesh.world != item.world ||
             mesh.geometry != item.geometry || mesh.material != item.material ||
-            mesh.geometry->revision != item.geometry->revision ||
-            mesh.material->revision != item.material->revision)
+            mesh.geometry->minimum != item.minimum || mesh.geometry->maximum != item.maximum)
             return false;
     }
     return true;

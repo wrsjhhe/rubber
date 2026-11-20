@@ -2,6 +2,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/constants.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -13,6 +14,13 @@
 
 namespace sim
 {
+AssetId nextAssetId()
+{
+    // 身份只需在本进程内唯一：缓存代际与身份都不跨进程，因此计数器从零开始，
+    // 也不可能因为对象释放而回退到曾被使用的值。
+    static std::atomic<AssetId> counter{0};
+    return ++counter;
+}
 namespace
 {
 void require(bool ok, const char* message)
@@ -200,6 +208,11 @@ Geometry ConvexGeometry(const std::vector<glm::vec3>& p)
     }
     return TriangleMeshGeometry(std::move(v), std::move(idx));
 }
+Texture::Texture(uint32_t w, uint32_t h, std::vector<uint8_t> pixels)
+    : width(w), height(h), rgba(std::move(pixels))
+{
+    require(w && h && uint64_t(w) * h * 4 == rgba.size(), "Texture size does not match pixel data");
+}
 std::shared_ptr<const Texture> Texture::load(const std::filesystem::path& path)
 {
     int w, h, channels;
@@ -207,8 +220,8 @@ std::shared_ptr<const Texture> Texture::load(const std::filesystem::path& path)
         stbi_load(path.string().c_str(), &w, &h, &channels, 4), stbi_image_free);
     if (!pixels)
         throw std::runtime_error("Cannot load texture: " + path.string());
-    return std::make_shared<Texture>(
-        Texture{uint32_t(w), uint32_t(h), {pixels.get(), pixels.get() + size_t(w) * h * 4}});
+    return std::make_shared<Texture>(uint32_t(w), uint32_t(h),
+                                     std::vector<uint8_t>(pixels.get(), pixels.get() + size_t(w) * h * 4));
 }
 uint32_t Scene::addGroup(glm::mat4 local, uint32_t parent)
 {
@@ -226,9 +239,14 @@ uint32_t Scene::add(Geometry geometry, std::shared_ptr<const MeshStandardMateria
                     uint32_t parent)
 {
     require(geometry && material, "Invalid mesh");
+    return add(std::move(geometry), *material, local, parent);
+}
+uint32_t Scene::add(Geometry geometry, const MeshStandardMaterial& material, glm::mat4 local, uint32_t parent)
+{
+    require(bool(geometry), "Invalid mesh");
     auto id = addGroup(local, parent);
     nodes.back().geometry = std::move(geometry);
-    nodes.back().material = std::move(material);
+    nodes.back().material = material;
     return id;
 }
 Object3D& Scene::get(uint32_t id)

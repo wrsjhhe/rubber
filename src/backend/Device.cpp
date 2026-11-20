@@ -266,6 +266,13 @@ bool UploadBatch::complete() const
 {
     return !fence || vkGetFenceStatus(d.device, fence) == VK_SUCCESS;
 }
+uint64_t UploadBatch::stagingBytes() const
+{
+    uint64_t bytes = 0;
+    for (auto& source : staging)
+        bytes += source->size;
+    return bytes;
+}
 void UploadBatch::wait()
 {
     if (!fence)

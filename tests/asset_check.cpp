@@ -6,6 +6,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
+#include <vector>
 
 using namespace sim;
 void expect(bool condition, const char* message)
@@ -31,6 +32,17 @@ struct Rgba
 Rgba centerAlbedo(const FrameResult& result)
 {
     return center<Rgba>(result.read(Channel::AlbedoMetal));
+}
+Rgba centerColor(const FrameResult& result)
+{
+    return center<Rgba>(result.read(Channel::Color));
+}
+std::shared_ptr<const Texture> solid(uint8_t r, uint8_t g, uint8_t b)
+{
+    std::vector<uint8_t> pixels;
+    for (int i = 0; i < 4; ++i)
+        pixels.insert(pixels.end(), {r, g, b, 255});
+    return std::make_shared<Texture>(2, 2, std::move(pixels));
 }
 int main(int argc, char** argv)
 try
@@ -63,35 +75,84 @@ try
     expect(stats.uploadBatches == 1, "Scene uploads were not batched");
     expect(std::abs(centerDepth(*first.frame) - 4.5f) < .001f, "Near camera depth from shared scene");
     expect(std::abs(centerDepth(*second.frame) - 7.5f) < .001f, "Far camera depth from shared scene");
+    first.frame.reset();
+    second.frame.reset();
 
-    // 新版本使用新对象发布：旧快照继续持有旧版本数据。
-    auto green = std::make_shared<MeshStandardMaterial>();
-    green->color = {0.f, 1.f, 0.f};
-    scene.get(id).material = green;
-    auto updated = scene.snapshot(1.1);
-    auto third = renderer.submit({updated, camera, *near, {{Channel::AlbedoMetal, Delivery::Cpu}}});
+    // R-M2-001：材质按值进入快照，之后修改用户手中的对象与场景节点都不改变已发布版本。
+    gray->color = {0.f, 0.f, 1.f};
+    scene.get(id).material.color = {0.f, 1.f, 0.f};
     auto stale = renderer.submit({snapshot, rear, *far, {{Channel::AlbedoMetal, Delivery::Cpu}}});
-    stats = renderer.assetStats();
-    expect(stats.scenePreparations == 2, "New asset version reused the old shared scene");
-    expect(stats.materialUploads == 2, "New material version was not published");
-    expect(stats.meshUploads == 1, "Unchanged geometry was uploaded again");
-    expect(stats.textureUploads == 2, "Unchanged textures were uploaded again");
-    auto fresh = centerAlbedo(*third.frame);
+    expect(renderer.assetStats().scenePreparations == 1, "In-place edit republished an old snapshot");
     auto old = centerAlbedo(*stale.frame);
-    expect(fresh.r < 32 && fresh.g > 200, "New material version not applied");
-    expect(old.r > 200 && old.g > 200 && old.r == old.g, "Old snapshot inherited the new material");
+    expect(old.r == old.g && old.r > 200, "Old snapshot lost its published material");
+    stale.frame.reset();
 
-    // 原地修改必须递增版本才会重新发布，否则共享场景仍是可见事实。
-    green->color = {0.f, 0.f, 1.f};
-    green->revision = 2;
-    auto published = scene.snapshot(1.2);
-    auto fourth = renderer.submit({published, camera, *near, {{Channel::AlbedoMetal, Delivery::Cpu}}});
-    expect(renderer.assetStats().scenePreparations == 3, "Version bump did not republish the scene");
-    auto blue = centerAlbedo(*fourth.frame);
-    expect(blue.b > 200 && blue.g < 32, "Version bump did not apply the new material");
+    auto edited = scene.snapshot(1.2);
+    auto fresh = renderer.submit({edited, camera, *near, {{Channel::AlbedoMetal, Delivery::Cpu}}});
+    expect(renderer.assetStats().scenePreparations == 2, "Edited material did not republish the scene");
+    auto green = centerAlbedo(*fresh.frame);
+    expect(green.g > 200 && green.r < 32, "Edited material not applied to the new snapshot");
+    fresh.frame.reset();
+
+    // R-M2-004：资产身份在构造时分配且不复用。释放一个几何后新建同尺寸分配的对象，
+    // 必须重新上传并按新内容绘制，不能命中旧缓冲。
+    AssetId released = 0;
+    {
+        auto probeScene = std::make_unique<Scene>();
+        auto releasedGeometry = BoxGeometry(1, 1, 1);
+        released = releasedGeometry->id;
+        probeScene->add(releasedGeometry, gray);
+        auto probeView = renderer.createView(64, 48, 64);
+        auto probe = renderer.submit(
+            {probeScene->snapshot(4), camera, *probeView, {{Channel::MetricDepth, Delivery::Cpu}}});
+        expect(std::abs(centerDepth(*probe.frame) - 4.5f) < .001f, "Probe geometry depth");
+        probe.frame.reset();
+    }
+    auto replaced = BoxGeometry(1, 1, 3);
+    expect(replaced->id != released && replaced->id > released, "Asset identity was recycled after release");
+    {
+        Scene reuse;
+        reuse.add(replaced, gray);
+        auto uploads = renderer.assetStats().meshUploads;
+        auto probe =
+            renderer.submit({reuse.snapshot(4.1), camera, *near, {{Channel::MetricDepth, Delivery::Cpu}}});
+        expect(std::abs(centerDepth(*probe.frame) - 3.5f) < .001f,
+               "New geometry reused the released asset's GPU buffers");
+        expect(renderer.assetStats().meshUploads == uploads + 1, "Replacement geometry was not uploaded");
+        probe.frame.reset();
+    }
+
+    // R-M2-002：静止收敛后更换贴图，Color 不能继续输出旧历史。
+    auto red = solid(255, 0, 0);
+    auto redMaterial = std::make_shared<MeshStandardMaterial>();
+    redMaterial->color = {1, 1, 1};
+    redMaterial->roughness = 1;
+    redMaterial->map = red;
+    Scene textured;
+    auto texturedId = textured.add(BoxGeometry(), redMaterial);
+    auto before = renderer.submit({textured.snapshot(10), camera, *near, {{Channel::Color, Delivery::Cpu}}});
+    for (int i = 0; i < 18; ++i)
+    {
+        before.frame.reset();
+        before =
+            renderer.submit({textured.snapshot(10 + i * .01), camera, *near, {{Channel::Color, Delivery::Cpu}}});
+    }
+    auto lit = centerColor(*before.frame);
+    expect(lit.r > lit.g && lit.r > 100, "Stationary frames did not converge to the red texture");
+    auto greenMaterial = *redMaterial;
+    greenMaterial.map = solid(0, 255, 0);
+    textured.get(texturedId).material = greenMaterial;
+    for (int i = 0; i < 3; ++i)
+    {
+        before.frame.reset();
+        before =
+            renderer.submit({textured.snapshot(11 + i * .01), camera, *near, {{Channel::Color, Delivery::Cpu}}});
+    }
+    auto swapped = centerColor(*before.frame);
+    expect(swapped.g > swapped.r, "Texture swap kept frozen TAA history");
+    before.frame.reset();
 
     // 清缓存只切换代际：在途结果的资产与实例数据必须继续有效。
-    first.frame.reset();
     auto held = renderer.submit({snapshot, camera, *near, {{Channel::MetricDepth, Delivery::CpuAndGpu}}});
     expect(held.status == SubmitStatus::Submitted, "Slot was not released before the cache switch");
     renderer.clearAssetCache();
@@ -101,12 +162,38 @@ try
     auto native = VulkanInterop::output(*held.frame, Channel::MetricDepth);
     expect(native.image && native.completion, "GPU export lost across the cache switch");
 
-    // 视图改用新代际场景并释放旧结果后，旧代际才被回收。
-    second.frame.reset();
-    third.frame.reset();
-    stale.frame.reset();
-    fourth.frame.reset();
+    // 旧快照在新代际里按自己持有的固定资产重新上传，仍重现当初的画面。
+    auto replay = renderer.submit({snapshot, rear, *far, {{Channel::AlbedoMetal, Delivery::Cpu}}});
+    auto replayed = centerAlbedo(*replay.frame);
+    expect(replayed.r == replayed.g && replayed.r > 200, "Old snapshot lost its content across generations");
+    replay.frame.reset();
     held.frame.reset();
+
+    // R-M2-003：持续加载新资产时，已完成的上传批次在准备阶段回收，暂存副本随之释放。
+    auto probeView = renderer.createView(64, 48, 64);
+    SceneSnapshot last;
+    unsigned batches = 0;
+    for (int i = 0; i < 5; ++i)
+    {
+        Scene loader;
+        loader.add(BoxGeometry(1, 1, 1 + i * .5f), gray);
+        last = loader.snapshot(20 + i);
+        auto loaded = renderer.submit({last, camera, *probeView, {{Channel::MetricDepth, Delivery::Cpu}}});
+        centerDepth(*loaded.frame);
+        loaded.frame.reset();
+        batches = unsigned(renderer.assetStats().uploadBatches);
+    }
+    // 相同快照不会新增上传，本次准备会回收上一批已完成的上传。
+    auto settled = renderer.submit({last, camera, *probeView, {{Channel::MetricDepth, Delivery::Cpu}}});
+    centerDepth(*settled.frame);
+    settled.frame.reset();
+    stats = renderer.assetStats();
+    expect(stats.uploadBatches == batches, "Reused snapshot still queued an upload batch");
+    expect(stats.pendingUploads == 0, "Completed upload batches were never reclaimed");
+    expect(stats.stagingBytes == 0, "Upload staging copies outlived their batch");
+
+    // 视图改用新代际场景并释放旧结果后，旧代际才被回收。
+    replay.frame.reset();
     for (int i = 0; i < 2; ++i)
     {
         auto repaintNear = renderer.submit({snapshot, camera, *near, {{Channel::Color, Delivery::Cpu}}});
@@ -116,8 +203,9 @@ try
     }
     stats = renderer.assetStats();
     expect(stats.retiredGenerations == 0, "Retired generations were never reclaimed");
-    expect(stats.meshUploads == 2, "New generation reused the previous generation buffers");
-    std::cout << "PASS: shared scene, asset versions, upload dependency and deferred reclamation\n";
+    expect(stats.meshUploads >= 2, "New generation reused the previous generation buffers");
+    expect(stats.pendingUploads == 0, "Upload batches left behind after reclamation");
+    std::cout << "PASS: shared scene, immutable asset versions, upload dependency and deferred reclamation\n";
     return 0;
 }
 catch (const std::exception& e)

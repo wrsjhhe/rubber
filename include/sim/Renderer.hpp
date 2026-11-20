@@ -74,10 +74,12 @@ struct AssetStats
 {
     uint64_t scenePreparations = 0;  // 新建共享场景版本次数
     uint64_t sceneReuses = 0;        // 命中相同快照内容的次数
-    uint64_t meshUploads = 0;        // 网格缓冲上传次数，键为身份与版本
-    uint64_t textureUploads = 0;     // 贴图上传次数，键为身份、版本与色彩空间
-    uint64_t materialUploads = 0;    // 材质描述符集创建次数
+    uint64_t meshUploads = 0;        // 网格缓冲上传次数，键为资产身份
+    uint64_t textureUploads = 0;     // 贴图上传次数，键为资产身份与色彩空间
+    uint64_t materialUploads = 0;    // 材质描述符集创建次数，键为材质内容
     uint64_t uploadBatches = 0;      // 已提交的上传批次数
+    uint32_t pendingUploads = 0;     // 尚未回收的上传批次数，正常提交路径应回落到零
+    uint64_t stagingBytes = 0;       // 这些批次仍持有的暂存字节数
     uint32_t retiredGenerations = 0; // 仍在等待在途提交结束的旧缓存代际数
 };
 class Renderer

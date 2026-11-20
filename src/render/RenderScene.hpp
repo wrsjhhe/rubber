@@ -25,6 +25,7 @@ static_assert(sizeof(ViewInstance) == 80);
 // 一个快照版本的共享 GPU 数据。网格、材质与静态实例数据只准备一次，
 // 由同一快照的所有视图复用；资产上传的完成值作为帧提交的时间线依赖。
 // 对象不可变：快照内容变化产生新版本，旧版本由旧快照与在途结果持有。
+// 每一项固定自己那份几何与材质值，因此用户之后修改手中的材质对象不会改变这里。
 class RenderScene
 {
   public:
@@ -32,7 +33,7 @@ class RenderScene
     {
         uint32_t id;
         Geometry geometry;
-        std::shared_ptr<const MeshStandardMaterial> material;
+        MeshStandardMaterial material;
         glm::mat4 world;
         glm::vec3 minimum, maximum;
         bool castsShadow;

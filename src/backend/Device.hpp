@@ -60,6 +60,8 @@ struct UploadBatch
     }
     Buf upload(const void* data, size_t bytes, VkBufferUsageFlags usage);
     Img texture(const Texture&, bool srgb);
+    // 本批次仍持有的复制源字节数；回收后归零。
+    uint64_t stagingBytes() const;
     // 提交整批复制；返回后续帧提交需要等待的时间线值。
     uint64_t submit();
     bool complete() const;

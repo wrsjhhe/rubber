@@ -27,12 +27,13 @@ struct Draw
     int cascade, stable;
 };
 constexpr unsigned temporalSamples = 16;
+// 视图侧历史记录快照当时的固定资产：几何身份与材质值。材质是值类型，内含的
+// 贴图只按不可变身份比较，所以更换贴图必然使静止冻结与重投影历史失效。
 struct MeshHistory
 {
     glm::mat4 world;
     Geometry geometry;
-    std::shared_ptr<const MeshStandardMaterial> material;
-    glm::vec4 colorRough, parameters;
+    MeshStandardMaterial material;
     bool castsShadow;
     uint32_t order;
     bool operator==(const MeshHistory&) const = default;
@@ -62,6 +63,7 @@ bool visible(const glm::mat4& world, glm::vec3 lo, glm::vec3 hi, const glm::mat4
     return true;
 }
 // 快照内容键：只描述影响共享 GPU 数据的字段，相机、时间与光照变化不改变键。
+// 几何与贴图用资产身份，材质用内容，因此用户手里的对象被修改或释放都不会让键漂移。
 uint64_t sceneKey(const SceneSnapshot& scene, uint64_t generation)
 {
     uint64_t hash = 1469598103934665603ull;
@@ -77,17 +79,21 @@ uint64_t sceneKey(const SceneSnapshot& scene, uint64_t generation)
     mix(&generation, sizeof(generation));
     for (auto& mesh : scene.meshes)
     {
-        auto geometry = mesh.geometry.get();
-        auto material = mesh.material.get();
-        auto geometryRevision = mesh.geometry ? mesh.geometry->revision : 0;
-        auto materialRevision = mesh.material ? mesh.material->revision : 0;
+        AssetId geometry = mesh.geometry ? mesh.geometry->id : 0;
         mix(&mesh.id, sizeof(mesh.id));
         mix(&mesh.castsShadow, sizeof(mesh.castsShadow));
         mix(&mesh.world, sizeof(mesh.world));
         mix(&geometry, sizeof(geometry));
-        mix(&geometryRevision, sizeof(geometryRevision));
-        mix(&material, sizeof(material));
-        mix(&materialRevision, sizeof(materialRevision));
+        auto& material = mesh.material;
+        mix(&material.color, sizeof(material.color));
+        mix(&material.roughness, sizeof(material.roughness));
+        mix(&material.metalness, sizeof(material.metalness));
+        mix(&material.uvRepeat, sizeof(material.uvRepeat));
+        for (const auto& texture : {material.map, material.normalMap, material.metalRoughMap})
+        {
+            AssetId id = texture ? texture->id : 0;
+            mix(&id, sizeof(id));
+        }
     }
     return hash;
 }
@@ -185,6 +191,8 @@ struct Renderer::Impl
     }
     void collect()
     {
+        // 当前代际也要回收：持续加载新资产时，已完成的批次不能留到切换代际才释放。
+        assets->collect();
         for (auto& cache : retired)
             cache->collect();
         std::erase_if(retired, [](const std::shared_ptr<AssetCache>& cache) { return cache.use_count() == 1; });
@@ -201,6 +209,14 @@ struct Renderer::Impl
     {
         auto snapshot = stats;
         snapshot.retiredGenerations = uint32_t(retired.size());
+        auto count = [&snapshot](const std::shared_ptr<AssetCache>& cache)
+        {
+            snapshot.pendingUploads += cache->pendingUploads();
+            snapshot.stagingBytes += cache->stagingBytes();
+        };
+        count(assets);
+        for (auto& cache : retired)
+            count(cache);
         return snapshot;
     }
 };
@@ -717,16 +733,10 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
     {
         auto& item = items[i];
         auto prev = v.lastModels.find(item.id);
-        auto& mat = *item.material;
-        MeshHistory state{item.world,
-                          item.geometry,
-                          item.material,
-                          {mat.color, mat.roughness},
-                          {mat.metalness, mat.uvRepeat.x, mat.uvRepeat.y, float(bool(mat.normalMap))},
-                          item.castsShadow,
-                          i};
+        MeshHistory state{item.world, item.geometry, item.material, item.castsShadow, i};
         if (!models.emplace(item.id, state).second)
             throw std::invalid_argument("Duplicate snapshot mesh ID");
+        // 资产身份或材质值变化即视为新对象：既不能复用旧姿态，也不能继续冻结历史。
         bool known = prev != v.lastModels.end() && prev->second.geometry == item.geometry &&
                      prev->second.material == item.material;
         stationary = stationary && known && prev->second == state;
