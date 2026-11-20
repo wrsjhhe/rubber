@@ -1,6 +1,6 @@
 # 实现进度
 
-## 最新状态（2026-11-20 / M3 修复提交）
+## 最新状态（2026-11-20 / 083f8fe）
 
 **M3 三项阻塞问题已修复，待复审。** 帧图的通用契约从"每个资源一个状态"改为逐个声明区间跟踪：缓冲按字节段跟踪写入者、读取者与是否已定义；图像子资源按 layer × mip 精确展开，不再把多 layer 的 mip 范围压平；写入依赖收集全部相交子资源的写入者与读取者，WAW/WAR 边不再丢失。新增 10 个 `graph_check` 用例，并用缺陷注入逐项确认它们在旧实现或注回缺陷后失败。Release 构建、六项 CTest、五项 `--validation`、Gallery 捕获与参考图差异（0.915%，`max_delta=1`）、`temporal_check` 数值均与上一版一致。详见 [M3 审核回应](REVIEW_M3_RESPONSE.md)。下方独立审核记录的"需修改"结论对应修复前的 996a779。
 
@@ -84,7 +84,7 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 
 任务编号 / 功能编号：M3 / F07，审核问题 R-M3-001 至 R-M3-003
 负责人 / 日期 / 状态：开发者 / 2026-11-20 / 待复审
-代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支"M3 修复：帧图的区间与子资源跟踪"提交
+代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支 083f8fe「M3 修复：帧图的区间与子资源跟踪（回应 REVIEW_M3）」
 修改文件 / 接口变化：
 - `src/render/graph/FrameGraph.hpp`：`BufferResource` 的单一 `state` 与 `written` 并集改为 `segments`（有序、不重叠、只覆盖已声明字节的区间，每段带 writer/defined/readers/lastWrite）；新增 `Segment` 结构；`Cell` 增加 `used`（本帧是否被活跃 pass 访问）；`Use` 增加精确 `cells`/`pieces`，`writers`/`readers` 改为相交子资源的去重全集；`cellRange` 换成 `cellsOf`，新增 `segmentsOf`/`findSegment`/`mergeSegments`
 - `src/render/graph/FrameGraph.cpp`：子资源按 layer × mip 双重展开；缓冲在声明边界切段并用导入状态填补空洞，依赖/屏障按段计算；`cull` 对导出缓冲逐段激活生产者；`order` 用全部写入者与读取者建 WAW/WAR 边并对重复边去重、跳过自环；`plan` 逐段判定未初始化读取并只对写过的段发导出屏障；导出/恢复只转换本帧 `used` 的子资源
