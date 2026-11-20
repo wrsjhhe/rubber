@@ -18,7 +18,7 @@ ctest --test-dir build -C Release --output-on-failure
 - `gallery --model path/to/asset.glb` 将静态不透明 glTF 模型放到展台上，也支持含外部缓冲和图片的 .gltf。
 - `gallery --capture image.png` 无窗口渲染并导出 PNG。可与 `--model` 组合。
 - `gallery --benchmark` 实测 1、4、8 个视图的批次耗时。每轮预热后统计 120 个批次，包含快照、录制、提交及最后一批 GPU 完成等待。
-- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单，`points_check --validation` 核对点云与网格的双向遮挡、强度/半径语义、相机姿态与双轴内参下的点尺寸，以及点云变化后 TAA 历史是否刷新。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断。validation 模式需要 SDK 验证层。
+- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单，`points_check --validation` 核对点云与网格的双向遮挡、强度/半径语义、相机姿态与双轴内参下的点尺寸，以及点云变化后 TAA 历史是否刷新、仅 Hdr 请求是否误推进历史基线。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断。validation 模式需要 SDK 验证层。
 - 仅编译引擎可传入 `-DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF`。嵌入其他程序时可用 `DeviceOptions::shaderDirectory` 指向生成的 SPIR-V 目录。当前 gallery 直接使用构建目录的着色器和源码目录的示例资产，移动可执行文件时需一并考虑这两个路径。
 - `python tools/pngdiff.py a.png b.png` 统计两张 PNG 的差异字节数、最大与平均通道差，用于核对捕获画面是否只差舍入。
 
@@ -67,7 +67,7 @@ auto frame = view->read();
 
 ## GPU 数据契约
 
-`View::imageView(Channel)` 暴露由视图持有的 VkImageView。附件在 render 提交完成后可按 SHADER_READ_ONLY_OPTIMAL 读取。外部消费者应使用相同设备，协调提交与资源生命周期。当前 Renderer 的录制、提交和缓存接口按单线程调用设计；场景快照可由调用方在仿真步边界生成后移交给渲染线程。仅由 GPU 消费时可打开 stableGeometry，获得像素中心的几何通道。TAA 与几何真值同时启用时，为保证采样位置会额外录制一次无抖动的几何 pass。`View::activePasses()` 返回上一帧实际执行的 pass 名，可用来确认裁剪结果；`View::stationary()` 返回上一帧是否判为静止（相机、光照与所有模块输入都与上一帧相同），可据此判断渐进细化是否收敛。几何真值或 GPU 交付请求不经过颜色链路，也不会让 TAA 历史失效。
+`View::imageView(Channel)` 暴露由视图持有的 VkImageView。附件在 render 提交完成后可按 SHADER_READ_ONLY_OPTIMAL 读取。外部消费者应使用相同设备，协调提交与资源生命周期。当前 Renderer 的录制、提交和缓存接口按单线程调用设计；场景快照可由调用方在仿真步边界生成后移交给渲染线程。仅由 GPU 消费时可打开 stableGeometry，获得像素中心的几何通道。TAA 与几何真值同时启用时，为保证采样位置会额外录制一次无抖动的几何 pass。`View::activePasses()` 返回上一帧实际执行的 pass 名，可用来确认裁剪结果；`View::stationary()` 返回上一帧是否判为静止（相机、光照与所有模块输入都与上一帧相同），可据此判断渐进细化是否收敛；它只在真正写入颜色历史的帧上为真——几何真值请求、以及时序解析被裁掉的仅 Hdr 请求都不推进历史槽与各模块的历史基线。
 
 | 通道 | 格式与语义 |
 |---|---|

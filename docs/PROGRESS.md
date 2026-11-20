@@ -1,5 +1,15 @@
 # 实现进度
 
+## 最新状态（2026-11-20 / M4 历史提交条件修复，待复审）
+
+**R-M4-002 补充（Hdr-only 推进未写入的颜色历史）已修复，待复审。** 历史状态不再按“本次需要颜色”判断，而是按“时序解析 pass 在编译后仍然存活、并在提交成功后确认”判断：`FrameGraph::executed(PassHandle)` 暴露编译期裁剪结果，`Renderer::renderFrame` 据此得到 `resolved`，只有它为真时才推进 `lastVP`/`stillSamples`/`lastTaa`/`historyNumber` 等视图历史状态，`View::stationary()` 也只在 `resolved` 的帧上为真。模块侧新增 `ModuleView::commitHistory(bool resolved)`：`declare` 只记录“待提交”的身份/姿态，`lastModels`（网格）与 `historyVersion/historyCount`（点云）只在确认提交后由 `commitHistory(true)` 落库。网格模块同步改为两段式——此前它也按 `res.color` 推进姿态基准，单纯修点云会让“移动网格 + Hdr-only + Color”出现真的旧画面。
+
+本轮验证：Release 构建通过；七项 CTest 全通过；六项 `--validation` 各 0 条校验错误；`gallery --capture m4history-capture.png --validation` 与 `--smoke --validation` 退出 0、0 条，捕获图与 `example/preview/courtyard.png` 差异仍为 37472/4096000 字节（0.915%）、`max_delta=1`；`temporal_check` raw=28.623 / TAA=6.28194、运动 347.217/293.813 逐位不变。三处缺陷注入均先失败后还原：把 `resolved` 改回 `color` → “Hdr-only frame disturbed the color history”；`MeshView` 恢复 `if (res.color) lastModels = models` → “Hdr-only frame advanced the mesh history baseline”；`PointsView` 恢复按 `res.color` 直接推进基线 → “Hdr-only frame advanced the color history baseline”。
+
+## 最新独立复审（2026-11-20 / 2b763cc）
+
+M4 暂需修改：R-M4-001/003 已修复，R-M4-002 尚缺 Hdr-only 不推进颜色历史的处理。该请求会令 res.color=true，但时序 pass 可被裁剪，导致点云基线和 View 历史槽推进而历史未写入。详见 [复审报告](REVIEW_M4.md)。独立 Release、七项 CTest、六项 --validation、Gallery smoke 全通过；本结论优先于下方历史状态。
+
 ## 最新独立审核（2026-11-20 / d4f07f0）
 
 **M4 需修改，尚未验收。** 独立 Release、七项 CTest、points_check --validation 与 Gallery smoke 通过；发现 VP 元素误用为焦距、点云缺少历史变化声明、颜色附件读改写屏障缺少读取访问三项阻塞问题。详见 [M4 审核报告](REVIEW_M4.md)。本结论优先于下方开发者待审核记录，M3 验收结论不变。
@@ -73,8 +83,8 @@ Release、四项 CTest、asset_check --validation、Gallery smoke 独立通过�
 | F05/F06 | 已有实现，待审核；Output.hpp、Renderer.hpp、VulkanInterop.hpp、request_check | 三份结果上限，导出复制，同 View 串行；旧 API 仍为最近帧 |
 | F05 几何路径 | 已有实现，待审核；submit/renderFrame | 跳过光照/TAA，新 View 不建颜色历史；仍写五个 G-buffer，用过颜色的 View 保留颜色资源 |
 | F02 缓存拆分 | 已验收（278371f）；render/RenderScene.hpp、render/RenderScene.cpp、assets/AssetCache.hpp、backend/Device.hpp、tests/asset_check.cpp | 场景准备仍在调用线程录制；实例缓冲按快照版本重新分配，未跨版本复用；上传批未限流 |
-| F07 帧图 | 已有实现，待审核；render/graph/FrameGraph.hpp、FrameGraph.cpp、tests/graph_check.cpp | 单队列顺序执行；保守屏障（每 pass 保守 stage/access，不做合并优化）；瞬时资源按描述缓存复用，未做显存别名。`readWrite` 的附件屏障按读改写补 `COLOR_ATTACHMENT_READ`，由 graph_check 断言 |
-| F08 模块与点云 | 已有实现，待审核；render/Module.hpp、modules/mesh、modules/points、shaders/points.vert、shaders/points.frag、render/passes/PointsPass.cpp、tests/points_check.cpp | 点云不在 CPU 侧剔除，也不参与阴影投射；无逐点历史，运动向量写零（运动分支不复用旧像素），静止冻结靠每视图的颜色历史基线失效；点云仍需按节点逐点展开到一份共享缓冲，总量受 `maxStorageBufferRange` 限制，上传批暂存未主动回收；gallery 示例场景尚未加入点云 |
+| F07 帧图 | 已有实现，待审核；render/graph/FrameGraph.hpp、FrameGraph.cpp、tests/graph_check.cpp | 单队列顺序执行；保守屏障（每 pass 保守 stage/access，不做合并优化）；瞬时资源按描述缓存复用，未做显存别名。`readWrite` 的附件屏障按读改写补 `COLOR_ATTACHMENT_READ`，由 graph_check 断言；`executed(PassHandle)` 暴露编译后的裁剪结果，供调度侧判断跨帧副作用是否真的发生 |
+| F08 模块与点云 | 已有实现，待审核；render/Module.hpp、modules/mesh、modules/points、shaders/points.vert、shaders/points.frag、render/passes/PointsPass.cpp、tests/points_check.cpp | 点云不在 CPU 侧剔除，也不参与阴影投射；无逐点历史，运动向量写零（运动分支不复用旧像素），静止冻结靠每视图的颜色历史基线失效；点云仍需按节点逐点展开到一份共享缓冲，总量受 `maxStorageBufferRange` 限制，上传批暂存未主动回收；gallery 示例场景尚未加入点云。颜色历史基线（网格姿态与点云身份）只经 `ModuleView::commitHistory(true)` 推进，未写入历史的帧（仅 Hdr、几何真值）不改变基线 |
 | F09 | 部分实现 | 已有内参、时间、真值输出和互操作头；无独立 Observation/sensors/presentation |
 | F10 | 待开发 | 无 install/export/find_package 验证 |
 | F11—F17 | 未实现 | 后续规划，不列为已支持 |
@@ -88,13 +98,15 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 | M1 | 已有实现，待审核 | F05/F06 请求、结果、槽位、互操作 | 双相机、旧结果不变、Busy/恢复、销毁 View/Renderer 后读取、非法请求及 GPU 寿命 |
 | M2 | M1；已验收（278371f） | RenderScene、共享静态实例数据、不可变资产版本、上传依赖、延迟回收 | asset_check：同快照两相机准备与上传各一次、旧快照在原对象被修改后与清缓存后仍重现原画面、身份不复用、静止收敛后换贴图的 Color 更新、上传批与暂存回落、旧代际最终回收、渲染输入只读的编译期断言 |
 | M3 | M2；已验收（715233d） | 帧图及六类独立 pass，资源声明与分配分离 | graph_check：裁剪、未初始化读取（图像与缓冲逐区间，含"局部写+整体覆写"合并路径）、同 pass 读写冲突、循环依赖、子资源精确展开、缓冲分段导出与生产者、跨子资源/跨区间 RAW/WAR/WAW、分段读后覆写的每段屏障源状态、usage 诊断、导出终态；pass_check：按输出通道断言活跃 pass 清单（含首帧历史清除与状态变化后的重建）；六项 CTest 与五项 --validation |
-| M4 | M3；已有实现，待审核 | 网格模块迁移、模块协议、点云 | points_check：同一快照两台相机下点在前/网格在前的遮挡互换、米制深度与实例标签取值、仅点云场景、点云 pass 相对网格 pass 的插入位置、强度→亮度与半径→覆盖互不影响、覆盖面积随分辨率平方增长；相同距离下俯仰/翻滚不改变覆盖、`fx != fy` 时足迹为椭圆；静止收敛后移动/删除/改强度的 Color 刷新、两相机各自的历史基线、几何真值交付不推进颜色基线。graph_check：读改写附件的 dstAccess 含读与写、普通覆盖写不含读。七项 CTest 与六项 --validation |
+| M4 | M3；已有实现，待审核 | 网格模块迁移、模块协议、点云 | points_check：同一快照两台相机下点在前/网格在前的遮挡互换、米制深度与实例标签取值、仅点云场景、点云 pass 相对网格 pass 的插入位置、强度→亮度与半径→覆盖互不影响、覆盖面积随分辨率平方增长；相同距离下俯仰/翻滚不改变覆盖、`fx != fy` 时足迹为椭圆；静止收敛后移动/删除/改强度的 Color 刷新、两相机各自的历史基线、几何真值交付不推进颜色基线；Hdr-only（关闭 TAA，时序解析被裁掉）不推进颜色历史与阈值基线、连续穿插 Hdr-only 不扰动颜色链路、网格移动 + Hdr-only 后颜色帧仍刷新。graph_check：读改写附件的 dstAccess 含读与写、普通覆盖写不含读。七项 CTest 与六项 --validation |
 | M5 | M4；待开发 | Observation、处理链入口、呈现隔离、互操作边界 | Beauty+调试同帧不串色；校准/时间一致；真值独立；无需实现全部 F11—F13 即可验收框架 |
 | M6 | M5；待开发 | 安装头文件/库/shader、导出 target/依赖 | 新安装前缀的外部项目 find_package 构建并离屏运行，不访问原源码/构建目录；关闭 example 可构建 |
 
 每项保留现有回归。F11—F17 分别立项，先补规格和质量/性能门槛。
 
 ## 已有验证与缺口
+
+本轮（M4 历史提交条件修复）：Release 构建成功；七项 CTest 全通过；六项 `--validation` 各 0 条；`gallery --capture m4history-capture.png --validation` 与 `--smoke --validation` 退出 0、0 条，参考图差异仍为 37472/4096000（0.915%）、`max_delta=1`；`temporal_check` 数值逐位不变。新增用例覆盖 Hdr-only（关闭 TAA 使时序解析被裁掉）不推进历史基线、连续穿插 Hdr-only 不扰动颜色链路、网格移动 + Hdr-only 后颜色帧仍刷新，三处缺陷注入（`resolved` 退回 `color`、`MeshView` 与 `PointsView` 恢复按 `res.color` 提交）均先失败后还原。
 
 本轮（M4 修复）：Release 构建成功；sensor/temporal/request/asset/pass/points 六项 CTest 与 graph_check 全通过；六项 `--validation` 各 0 条；`gallery --capture` 与 `--smoke` 各退出 0、0 条，参考图差异仍为 37472/4096000（0.915%）、`max_delta=1`；`temporal_check` 数值逐位不变。新增用例均以缺陷注入确认有效（焦距回退、去掉 `unchanged`、基线无条件推进、去掉附件读访问四处先失败后还原）。补测同时暴露第三个点云路径缺陷：几何真值交付只有五个附件却绑定六附件管线，已改为按是否有 HDR 附件选管线。
 
@@ -110,9 +122,40 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 
 缺陷注入核对：把 TAA 历史比较临时放宽为只比几何与变换（去掉材质与贴图身份）后，asset_check 在"Texture swap kept frozen TAA history"处失败；把几何包围盒改回可变成员后，asset_check 以 `static_assert failed: 'Bounds are mutable'`（C2338）编译失败。两处用例因此确认有效，均已还原。
 
-尚缺显存分配自动统计证据、多队列/异步计算路径、显存别名复用，以及安装测试。点云已由 points_check 覆盖单点数据、双相机遮挡、仅点云场景、两种分辨率、强度/半径语义、相机姿态与双轴内参下的足迹，以及静止收敛后移动/删除/改强度与几何真值帧的颜色刷新；尚未覆盖大规模点云、逐点运动、阴影投射与上传批暂存回收。活跃 pass 清单已由 pass_check 按输出通道逐项断言，但只覆盖本仓库现存的通道组合，未覆盖全部请求×交付×选项组合。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。
+尚缺显存分配自动统计证据、多队列/异步计算路径、显存别名复用，以及安装测试。点云已由 points_check 覆盖单点数据、双相机遮挡、仅点云场景、两种分辨率、强度/半径语义、相机姿态与双轴内参下的足迹、静止收敛后移动/删除/改强度与几何真值帧的颜色刷新，以及 Hdr-only 与穿插 Hdr-only 帧的历史提交条件；尚未覆盖大规模点云、逐点运动、阴影投射与上传批暂存回收。活跃 pass 清单已由 pass_check 按输出通道逐项断言，但只覆盖本仓库现存的通道组合，未覆盖全部请求×交付×选项组合。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。
 
 ## 交接记录
+
+### M4 修复 2 / F07+F08（回应 R-M4-002 补充：Hdr-only 推进未写入的颜色历史）
+
+任务编号 / 功能编号：M4 / F08 + F07，审核问题 R-M4-002（补充）
+负责人 / 日期 / 状态：开发者 / 2026-11-20 / 待复审
+代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支 M4 历史提交条件修复（接 2b763cc）
+修改文件 / 接口变化：
+- `src/render/graph/FrameGraph.hpp`、`FrameGraph.cpp`：新增 `bool executed(PassHandle) const`，保存编译期裁剪结果（`livePasses`），`reset()` 一并清空；pass 是否真的执行不再靠名字列表或意图标志推断
+- `src/render/Renderer.cpp`：`temporal` 句柄在声明前 `reserve`，`compile()` 后求 `resolved = color && graph.executed(temporalHandle)`；`lastVP`/`stillSamples`/`lastSun`/`lastLights`/`lastShadows`/`lastTaa`/`lastChannel`/`time`/`historyNumber` 只在 `resolved` 时推进；`View::stationary()` 改为 `resolved && stationary`；提交成功后调用 `module->commitHistory(resolved)`
+- `src/render/Module.hpp`：`ModuleView::commitHistory(bool resolved)`，默认空实现；契约写明 declare 阶段不得改写历史基线
+- `src/modules/points/PointsModule.cpp`：`pendingVersion/pendingCount` 在 declare 记录，`commitHistory(true)` 才写入 `historyVersion/historyCount`
+- `src/modules/mesh/MeshModule.cpp`：新增 `pendingModels`，declare 只写它；`commitHistory(true)` 才 `lastModels = std::move(pendingModels)`，删掉原来的 `if (res.color) lastModels = std::move(models)`
+- `tests/points_check.cpp`：新增 `hasPass()` 与 Hdr-only 用例组
+已完成：
+- 仅导出 Hdr 且关闭 TAA 时，时序解析既无导出根也无副作用根，被帧图裁掉（用例直接断言活跃清单里没有 `temporal`）；该帧不推进视图历史状态，也不推进点云/网格基线
+- 内容未变时“收敛 → Hdr-only → Color”仍是静止的（历史里正是这份内容，无需重新积累）；内容变化时同样的序列必须刷新，且新位置出现点、旧位置回落背景
+- 连续三帧穿插 Hdr-only 与 Color，颜色帧保持静止且画面不变；启用 TAA 的 Hdr 请求因历史写回副作用保留时序解析，属正常推进路径，用例另行确认
+- 网格侧同构：移动箱体后只请求 Hdr，随后的 Color 必须显示新位置，不能被冻结在旧姿态
+仍缺项：
+- 历史提交条件只覆盖“时序解析是否执行”；`color` pass 被裁（仅导出 Hdr）时 `display` 不更新，这一点按设计如此，但尚无集成方文档说明 `View::read()` 与请求通道的对应关系
+- 沿用上一轮：点云上传在图外、暂存未回收、无逐点速度与阴影投射；单队列顺序执行、屏障保守、瞬时资源无显存别名；gallery 示例场景未加入点云
+环境 / 精确构建测试命令：Windows、Visual Studio 2022 x64、Vulkan SDK 1.4.357.0、RTX 3080 Ti
+- `cmake --build build-dev --config Release`
+- `ctest --test-dir build-dev -C Release --output-on-failure`
+- `sensor_check|temporal_check|request_check|asset_check|pass_check|points_check --validation`
+- `gallery --capture build-dev/m4history-capture.png --validation`；`gallery --smoke --validation`
+结果 / 日志截图位置：七项 CTest 全通过；六项 `--validation` 与 gallery 均 0 条校验错误；捕获图与参考图差异 37472/4096000（0.915%）、`max_delta=1`；`temporal_check` 数值逐位不变
+缺陷注入核对：三处均先失败后还原——`resolved` 改回 `color` → “Hdr-only frame disturbed the color history”；`MeshView` 恢复 `if (res.color) lastModels = models` → “Hdr-only frame advanced the mesh history baseline”；`PointsView` 恢复按 `res.color` 直接推进基线 → “Hdr-only frame advanced the color history baseline”
+性能和画质对比：未做性能测量；每帧多一次 `livePasses` 查询（O(1)），模块多保存一份待提交姿态表（与上一帧表同尺寸）
+已知问题 / 下一步：等待复审；通过后进入 M5（Observation、处理链入口、呈现隔离、互操作边界）
+审核人 / 审核版本 / 结论 / 问题编号：待填
 
 ### M4 修复 / F07+F08（回应 R-M4-001/002/003）
 
@@ -123,7 +166,7 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 - `src/render/FrameData.hpp`、`shaders/frame.glsl`：`Globals` 末尾新增 `vec4 lens`（纯投影两轴焦距，像素单位），尺寸 1072 → 1088
 - `src/render/Renderer.cpp`：单独求投影矩阵并填 `lens = {|P00|*w/2, |P11|*h/2}`，再与视图相乘得 `vp`；`View::Impl::stationary` 记录上一帧静止判定，`View::stationary()` 对外可见（只在颜色帧为真）
 - `shaders/points.vert`：像素半径改为 `vec2(radius*fx, radius*fy)/视深`，偏移按 `2*pixels/resolution*w` 写回裁剪空间
-- `src/modules/points/PointsModule.cpp`：`PointsView::unchanged()` 覆写，按"上次写入颜色历史时的共享缓冲版本 + 点数"判定；只有颜色帧推进基线；点云存储缓冲以 `StorageRead` 登记进帧图
+- `src/modules/points/PointsModule.cpp`：`PointsView::unchanged()` 覆写，按"上次写入颜色历史时的共享缓冲版本 + 点数"判定（本轮的“按 res.color 推进基线”已被下一条记录的 `commitHistory` 取代）；点云存储缓冲以 `StorageRead` 登记进帧图
 - `src/render/graph/FrameGraph.cpp`：`stageAccess(Access, readsBack)`，颜色附件读改写补 `COLOR_ATTACHMENT_READ`
 - `src/render/passes/PointsPass.cpp`：点云管线按"是否有 HDR 附件"选择，而不是按是否真值 pass
 - `tests/graph_check.cpp`、`tests/points_check.cpp`：新增对应用例
