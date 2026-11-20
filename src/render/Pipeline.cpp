@@ -116,7 +116,7 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
         life.release.push_back([this, h] { vkDestroyDescriptorSetLayout(d.device, h, nullptr); });
         return h;
     };
-    frame = setLayout(2, true);
+    frame = setLayout(3, true);
     material = setLayout(3, false);
     lighting = setLayout(7, false);
     resolve = setLayout(4, false);
@@ -163,7 +163,7 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
 VkDescriptorPool descriptorPool(Device& d, Lifetime& life, uint32_t count)
 {
     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, count},
-                                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, count},
+                                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, count * 3},
                                     {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, count * 7}};
     VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     ci.maxSets = count;

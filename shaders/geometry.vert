@@ -13,7 +13,7 @@ void main() {
     worldPosition = p.xyz;
     worldNormal = transpose(inverse(mat3(m.model))) * normal;
     texcoord = uv * m.material.yz;
-    oldClip = frame.oldVP * m.oldModel * vec4(position,1);
+    oldClip = frame.oldVP * histories.data[draw.object].oldModel * vec4(position,1);
     gl_Position = frame.vp * p;
     if (draw.stable == 0) gl_Position.xy += frame.jitter.xy * gl_Position.w;
 }

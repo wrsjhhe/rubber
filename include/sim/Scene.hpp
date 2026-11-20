@@ -19,6 +19,9 @@ class BufferGeometry
     const std::vector<Vertex> vertices;
     const std::vector<uint32_t> indices;
     glm::vec3 minimum{}, maximum{};
+    // 内容版本。几何发布后按不可变资产使用；改变内容必须递增版本，
+    // 渲染缓存以“对象身份 + 版本”为键，旧快照继续持有旧版本。
+    uint64_t revision = 1;
 };
 using Geometry = std::shared_ptr<const BufferGeometry>;
 Geometry BoxGeometry(float width = 1, float height = 1, float depth = 1);
@@ -33,6 +36,8 @@ struct Texture
 {
     uint32_t width, height;
     std::vector<uint8_t> rgba;
+    // 内容版本，语义同 BufferGeometry::revision。
+    uint64_t revision = 1;
     static std::shared_ptr<const Texture> load(const std::filesystem::path& path);
 };
 struct MeshStandardMaterial
@@ -42,6 +47,8 @@ struct MeshStandardMaterial
     float metalness = 0;
     glm::vec2 uvRepeat{1};
     std::shared_ptr<const Texture> map, normalMap, metalRoughMap;
+    // 内容版本。原地修改上述字段后递增版本，缓存才会重建材质与贴图绑定。
+    uint64_t revision = 1;
 };
 struct Mesh
 {

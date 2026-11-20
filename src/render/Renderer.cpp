@@ -1,8 +1,10 @@
 #include "Pipeline.hpp"
+#include "RenderScene.hpp"
 #include "../assets/AssetCache.hpp"
 #include "sim/VulkanInterop.hpp"
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <unordered_map>
 #include <stdexcept>
@@ -18,14 +20,7 @@ struct Globals
     glm::mat4 vp, oldVP, invVP, lightVP[4];
     glm::vec4 eye, sunDirection, sunColor, splits, jitter, settings, pointPosition[16], pointColor[16], info;
 };
-struct Instance
-{
-    glm::mat4 model, oldModel;
-    glm::vec4 colorRough, material;
-    glm::uvec4 label;
-    glm::vec4 boundsLo, boundsHi;
-};
-static_assert(sizeof(Globals) == 1072 && sizeof(Instance) == 208);
+static_assert(sizeof(Globals) == 1072);
 struct Draw
 {
     uint32_t object;
@@ -54,9 +49,9 @@ std::array<glm::vec4, 8> corners(const glm::mat4& m, glm::vec3 lo, glm::vec3 hi)
         p[i] = m * glm::vec4(i & 1 ? hi.x : lo.x, i & 2 ? hi.y : lo.y, i & 4 ? hi.z : lo.z, 1);
     return p;
 }
-bool visible(const Mesh& mesh, const glm::mat4& vp)
+bool visible(const glm::mat4& world, glm::vec3 lo, glm::vec3 hi, const glm::mat4& vp)
 {
-    auto p = corners(vp * mesh.world, mesh.geometry->minimum, mesh.geometry->maximum);
+    auto p = corners(vp * world, lo, hi);
     for (int axis = 0; axis < 3; ++axis)
     {
         if (std::all_of(p.begin(), p.end(), [&](auto v) { return v[axis] < (axis == 2 ? 0.f : -v.w); }))
@@ -66,7 +61,38 @@ bool visible(const Mesh& mesh, const glm::mat4& vp)
     }
     return true;
 }
-void fitShadows(Globals& g, const PerspectiveCamera& camera, const SceneSnapshot& scene, uint32_t tile)
+// 快照内容键：只描述影响共享 GPU 数据的字段，相机、时间与光照变化不改变键。
+uint64_t sceneKey(const SceneSnapshot& scene, uint64_t generation)
+{
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&hash](const void* data, size_t bytes)
+    {
+        auto bytes8 = static_cast<const uint8_t*>(data);
+        for (size_t i = 0; i < bytes; ++i)
+        {
+            hash ^= bytes8[i];
+            hash *= 1099511628211ull;
+        }
+    };
+    mix(&generation, sizeof(generation));
+    for (auto& mesh : scene.meshes)
+    {
+        auto geometry = mesh.geometry.get();
+        auto material = mesh.material.get();
+        auto geometryRevision = mesh.geometry ? mesh.geometry->revision : 0;
+        auto materialRevision = mesh.material ? mesh.material->revision : 0;
+        mix(&mesh.id, sizeof(mesh.id));
+        mix(&mesh.castsShadow, sizeof(mesh.castsShadow));
+        mix(&mesh.world, sizeof(mesh.world));
+        mix(&geometry, sizeof(geometry));
+        mix(&geometryRevision, sizeof(geometryRevision));
+        mix(&material, sizeof(material));
+        mix(&materialRevision, sizeof(materialRevision));
+    }
+    return hash;
+}
+void fitShadows(Globals& g, const PerspectiveCamera& camera, const std::vector<RenderScene::Item>& items,
+                uint32_t tile)
 {
     glm::vec3 dir = g.sunDirection;
     auto rotation =
@@ -76,10 +102,10 @@ void fitShadows(Globals& g, const PerspectiveCamera& camera, const SceneSnapshot
         p = rotation * (p / p.w);
     // 把当前场景潜在投影物体的深度纳入覆盖范围。
     float loZ = frustum[0].z, hiZ = loZ;
-    for (auto& m : scene.meshes)
-        if (m.castsShadow)
+    for (auto& item : items)
+        if (item.castsShadow)
         {
-            for (auto p : corners(rotation * m.world, m.geometry->minimum, m.geometry->maximum))
+            for (auto p : corners(rotation * item.world, item.minimum, item.maximum))
             {
                 loZ = std::min(loZ, p.z);
                 hiZ = std::max(hiZ, p.z);
@@ -126,19 +152,63 @@ struct Renderer::Impl
     Lifetime life;
     std::unique_ptr<Pipelines> pipelines;
     std::filesystem::path shaderDirectory;
+    AssetStats stats;
     std::shared_ptr<AssetCache> assets;
+    // 已切换但仍有在途帧或视图引用的旧缓存代际，待最后一个引用消失后释放。
+    std::vector<std::shared_ptr<AssetCache>> retired;
+    std::unordered_map<uint64_t, std::weak_ptr<RenderScene>> scenes;
+    uint64_t nextGeneration = 0, nextSceneVersion = 0;
     explicit Impl(const DeviceOptions& o)
     {
         d.init(o);
         shaderDirectory =
             o.shaderDirectory.empty() ? std::filesystem::path(RENDERER_SHADER_DIR) : o.shaderDirectory;
         pipelines = std::make_unique<Pipelines>(d, shaderDirectory);
-        assets = std::make_shared<AssetCache>(d, *pipelines);
+        assets = std::make_shared<AssetCache>(d, *pipelines, stats, ++nextGeneration);
+    }
+    // 键相同且内容一致的快照复用同一份共享场景，因此同快照的多台相机只准备与上传一次。
+    std::shared_ptr<RenderScene> prepare(const SceneSnapshot& scene)
+    {
+        collect();
+        auto key = sceneKey(scene, assets->generation);
+        if (auto it = scenes.find(key); it != scenes.end())
+            if (auto live = it->second.lock(); live && live->matches(scene))
+            {
+                ++stats.sceneReuses;
+                return live;
+            }
+        auto prepared = std::make_shared<RenderScene>(d, assets, scene, ++nextSceneVersion);
+        scenes[key] = prepared;
+        ++stats.scenePreparations;
+        std::erase_if(scenes, [](const auto& entry) { return entry.second.expired(); });
+        return prepared;
+    }
+    void collect()
+    {
+        for (auto& cache : retired)
+            cache->collect();
+        std::erase_if(retired, [](const std::shared_ptr<AssetCache>& cache) { return cache.use_count() == 1; });
+    }
+    // 只切换代际；旧代际的缓冲可能仍被在途提交读取，因此不能立即销毁。
+    void retireAssets()
+    {
+        retired.push_back(assets);
+        assets = std::make_shared<AssetCache>(d, *pipelines, stats, ++nextGeneration);
+        scenes.clear();
+        collect();
+    }
+    AssetStats statsOf() const
+    {
+        auto snapshot = stats;
+        snapshot.retiredGenerations = uint32_t(retired.size());
+        return snapshot;
     }
 };
 struct FrameResult::Impl
 {
     std::shared_ptr<Renderer::Impl> owner;
+    // 结果持有产生它的共享场景，保证 GPU 完成前资产与实例数据存活。
+    std::shared_ptr<RenderScene> scene;
     Lifetime life;
     std::vector<OutputInfo> infos;
     std::vector<Img> images;
@@ -222,8 +292,9 @@ struct View::Impl
     Img g[5], depth, shadow, hdr, history[2], display;
     std::vector<std::weak_ptr<FrameResult>> results;
     std::weak_ptr<FrameResult> pendingExport;
-    std::shared_ptr<AssetCache> frameAssets;
-    Buf globals, instances, staging;
+    // 视图只保留相机相关状态：当前共享场景、上一帧变换与历史。
+    std::shared_ptr<RenderScene> scene;
+    Buf globals, viewData, staging;
     VkCommandBuffer cmd{};
     VkFence fence{};
     VkDescriptorSet frame{}, lighting{}, resolve[2]{};
@@ -266,6 +337,18 @@ struct View::Impl
         if (number)
             vkWaitForFences(d.device, 1, &fence, VK_TRUE, UINT64_MAX);
     }
+    // 共享场景的缓冲与视图历史只在等待本视图上一帧后重新绑定。
+    void useScene(const std::shared_ptr<RenderScene>& next)
+    {
+        if (scene == next)
+            return;
+        scene = next;
+        auto bytes = std::max<size_t>(1, scene->items().size()) * sizeof(ViewInstance);
+        if (!viewData || viewData->size < bytes)
+            viewData = d.buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+        bindBuffer(d, frame, 1, scene->instances(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        bindBuffer(d, frame, 2, *viewData, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    }
     void ensureColor()
     {
         if (display)
@@ -292,20 +375,20 @@ struct View::Impl
             bindImage(d, resolve[i], 3, *history[1 - i], pipe.linear);
         }
     }
-    void draw(const Packet& p, uint32_t i, int cascade, bool stable)
+    void draw(const RenderScene::Item& item, uint32_t i, int cascade, bool stable)
     {
         VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &p.mesh->vertices->handle, &offset);
-        vkCmdBindIndexBuffer(cmd, p.mesh->indices->handle, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &item.mesh->vertices->handle, &offset);
+        vkCmdBindIndexBuffer(cmd, item.mesh->indices->handle, 0, VK_INDEX_TYPE_UINT32);
         if (cascade < 0)
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.meshLayout, 1, 1, &p.material, 0,
-                                    nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.meshLayout, 1, 1, &item.materialSet,
+                                    0, nullptr);
         Draw push{i, std::max(cascade, 0), stable};
         vkCmdPushConstants(cmd, pipe.meshLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(push), &push);
-        vkCmdDrawIndexed(cmd, p.mesh->count, 1, 0, 0, 0);
+        vkCmdDrawIndexed(cmd, item.mesh->count, 1, 0, 0, 0);
     }
-    void shadowPass(const SceneSnapshot& scene, const std::vector<Packet>& packets, const Globals& f, bool enabled)
+    void shadowPass(const std::vector<RenderScene::Item>& items, const Globals& f, bool enabled)
     {
         if (enabled)
         {
@@ -314,18 +397,18 @@ struct View::Impl
             for (int c = 0; c < 4; ++c)
             {
                 viewport(cmd, (c % 2) * tile, (c / 2) * tile, tile, tile);
-                for (uint32_t i = 0; i < scene.meshes.size(); ++i)
+                for (uint32_t i = 0; i < items.size(); ++i)
                 {
-                    auto& m = scene.meshes[i];
-                    if (m.castsShadow && visible(m, f.lightVP[c]))
-                        draw(packets[i], i, c, false);
+                    auto& item = items[i];
+                    if (item.castsShadow && visible(item.world, item.minimum, item.maximum, f.lightVP[c]))
+                        draw(item, i, c, false);
                 }
             }
             vkCmdEndRendering(cmd);
         }
         shadow->transition(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
-    void geometryPass(const std::vector<Packet>& packets, const std::vector<uint32_t>& list, bool stable)
+    void geometryPass(const std::vector<RenderScene::Item>& items, const std::vector<uint32_t>& list, bool stable)
     {
         std::array<Image*, 5> colors;
         for (int i = 0; i < 5; ++i)
@@ -333,7 +416,7 @@ struct View::Impl
         beginPass(cmd, colors, depth.get());
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.geometry);
         for (auto i : list)
-            draw(packets[i], i, -1, stable);
+            draw(items[i], i, -1, stable);
         vkCmdEndRendering(cmd);
         for (auto& img : g)
             img->transition(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -373,7 +456,11 @@ View::View(std::unique_ptr<Impl> p) : impl(std::move(p)) {}
 View::~View() = default;
 void Renderer::clearAssetCache()
 {
-    impl->assets = std::make_shared<AssetCache>(impl->d, *impl->pipelines);
+    impl->retireAssets();
+}
+AssetStats Renderer::assetStats() const
+{
+    return impl->statsOf();
 }
 const DeviceHandles& Renderer::handles() const
 {
@@ -410,6 +497,8 @@ Submission Renderer::submit(const RenderRequest& request)
     std::erase_if(v.results, [](const auto& result) { return result.expired(); });
     if (v.results.size() >= 3)
         return {};
+    // 同内容快照在此复用同一份共享场景，两台相机不会重复准备或上传。
+    auto prepared = impl->prepare(request.scene);
 
     auto state = std::make_shared<FrameResult::Impl>(impl);
     state->timestamp = request.scene.time;
@@ -464,7 +553,7 @@ Submission Renderer::submit(const RenderRequest& request)
         options.taa = false;
         options.shadows = false;
     }
-    renderFrame(request.scene, request.camera, request.view, options, color);
+    renderFrame(prepared, request.scene, request.camera, request.view, options, color);
 
     auto cmd = state->command;
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -492,6 +581,8 @@ Submission Renderer::submit(const RenderRequest& request)
     }
     check(vkEndCommandBuffer(cmd), "end output export");
     auto result = std::shared_ptr<FrameResult>(new FrameResult(state));
+    // 结果与视图共同持有共享场景，GPU 完成前资产与实例数据不会被回收。
+    state->scene = prepared;
     v.results.push_back(result);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
@@ -568,54 +659,52 @@ Frame View::read() const
 void Renderer::render(const SceneSnapshot& scene, const PerspectiveCamera& camera, View& view,
                       const RenderOptions& o)
 {
-    renderFrame(scene, camera, view, o, true);
+    if (view.impl->owner != impl)
+        throw std::invalid_argument("View belongs to a different renderer");
+    renderFrame(impl->prepare(scene), scene, camera, view, o, true);
 }
-void Renderer::renderFrame(const SceneSnapshot& scene, const PerspectiveCamera& camera, View& view,
-                           const RenderOptions& o, bool color)
+void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const SceneSnapshot& snapshot,
+                           const PerspectiveCamera& camera, View& view, const RenderOptions& o, bool color)
 {
     auto& v = *view.impl;
     if (v.owner != impl)
         throw std::invalid_argument("View belongs to a different renderer");
-    if (scene.lights.size() > 16 || glm::length(scene.sun.direction) < 1e-6f)
+    if (snapshot.lights.size() > 16 || glm::length(snapshot.sun.direction) < 1e-6f)
         throw std::invalid_argument("Invalid lights");
+    if (scene->items().size() != snapshot.meshes.size())
+        throw std::invalid_argument("Scene does not match snapshot");
     view.wait();
     if (color)
         v.ensureColor();
-    v.frameAssets = impl->assets;
+    // 本视图上一帧已完成，此时才能替换共享平台缓冲与描述符绑定。
+    v.useScene(scene);
+    auto& items = scene->items();
 
     Globals f{};
     f.vp = camera.projection(v.w, v.h) * camera.view();
     f.oldVP = v.lastVP;
     f.invVP = glm::inverse(f.vp);
     f.eye = {camera.position, 1};
-    f.sunDirection = {glm::normalize(scene.sun.direction), 0};
-    f.sunColor = {scene.sun.radiance, 1};
+    f.sunDirection = {glm::normalize(snapshot.sun.direction), 0};
+    f.sunColor = {snapshot.sun.radiance, 1};
     bool accumulate =
-        o.taa && v.lastTaa && !o.resetHistory && v.lastChannel == o.debugChannel && scene.time >= v.time;
-    accumulate = accumulate && scene.sun.direction == v.lastSun.direction &&
-                 scene.sun.radiance == v.lastSun.radiance && sameLights(scene.lights, v.lastLights) &&
+        o.taa && v.lastTaa && !o.resetHistory && v.lastChannel == o.debugChannel && snapshot.time >= v.time;
+    accumulate = accumulate && snapshot.sun.direction == v.lastSun.direction &&
+                 snapshot.sun.radiance == v.lastSun.radiance && sameLights(snapshot.lights, v.lastLights) &&
                  o.shadows == v.lastShadows;
-    bool stationary = accumulate && f.vp == v.lastVP && scene.meshes.size() == v.lastModels.size();
+    bool stationary = accumulate && f.vp == v.lastVP && items.size() == v.lastModels.size();
     auto index = (v.number % temporalSamples) + 1;
     glm::vec2 jitter =
         o.taa ? glm::vec2((2 * halton(index, 2) - 1) / v.w, (2 * halton(index, 3) - 1) / v.h) : glm::vec2(0);
     f.jitter = {jitter, 0, 0};
     f.settings = {o.exposure, float(accumulate), float(o.shadows), float(o.debugChannel)};
-    f.info = {float(scene.lights.size()), 1.f / v.w, 1.f / v.h, 0};
-    for (size_t i = 0; i < scene.lights.size(); ++i)
+    f.info = {float(snapshot.lights.size()), 1.f / v.w, 1.f / v.h, 0};
+    for (size_t i = 0; i < snapshot.lights.size(); ++i)
     {
-        f.pointPosition[i] = {scene.lights[i].position, 1};
-        f.pointColor[i] = {scene.lights[i].intensity, 1};
+        f.pointPosition[i] = {snapshot.lights[i].position, 1};
+        f.pointColor[i] = {snapshot.lights[i].intensity, 1};
     }
 
-    size_t bytes = std::max<size_t>(1, scene.meshes.size()) * sizeof(Instance);
-    if (bytes > v.d.properties.limits.maxStorageBufferRange)
-        throw std::length_error("Instance buffer exceeds device limit");
-    if (!v.instances || v.instances->size < bytes)
-    {
-        v.instances = v.d.buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
-        bindBuffer(v.d, v.frame, 1, *v.instances, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    }
     auto rasterVP = f.vp;
     for (unsigned j = 0; j < 4; ++j)
     {
@@ -623,41 +712,33 @@ void Renderer::renderFrame(const SceneSnapshot& scene, const PerspectiveCamera& 
         rasterVP[j].y += jitter.y * rasterVP[j].w;
     }
     std::vector<uint32_t> visibleList;
-    std::vector<Packet> packets;
     std::unordered_map<uint32_t, MeshHistory> models;
-    for (uint32_t i = 0; i < scene.meshes.size(); ++i)
+    for (uint32_t i = 0; i < items.size(); ++i)
     {
-        auto& m = scene.meshes[i];
-        if (!m.geometry || !m.material || !m.id)
-            throw std::invalid_argument("Invalid snapshot mesh");
-        auto prev = v.lastModels.find(m.id);
-        auto& mat = *m.material;
-        MeshHistory state{m.world,
-                          m.geometry,
-                          m.material,
+        auto& item = items[i];
+        auto prev = v.lastModels.find(item.id);
+        auto& mat = *item.material;
+        MeshHistory state{item.world,
+                          item.geometry,
+                          item.material,
                           {mat.color, mat.roughness},
                           {mat.metalness, mat.uvRepeat.x, mat.uvRepeat.y, float(bool(mat.normalMap))},
-                          m.castsShadow,
+                          item.castsShadow,
                           i};
-        if (!models.emplace(m.id, state).second)
+        if (!models.emplace(item.id, state).second)
             throw std::invalid_argument("Duplicate snapshot mesh ID");
-        bool known = prev != v.lastModels.end() && prev->second.geometry == m.geometry &&
-                     prev->second.material == m.material;
+        bool known = prev != v.lastModels.end() && prev->second.geometry == item.geometry &&
+                     prev->second.material == item.material;
         stationary = stationary && known && prev->second == state;
-        Instance obj{m.world,
-                     known ? prev->second.world : m.world,
-                     state.colorRough,
-                     state.parameters,
-                     {m.id, known, 0, 0},
-                     {m.geometry->minimum, 1},
-                     {m.geometry->maximum, 1}};
-        std::memcpy(static_cast<char*>(v.instances->mapped) + i * sizeof(obj), &obj, sizeof(obj));
-        packets.push_back({&v.frameAssets->mesh(m.geometry), v.frameAssets->material(m.material)});
-        if (!o.culling || visible(m, f.vp) || (o.taa && visible(m, rasterVP)))
+        // 视图只写上一帧变换与匹配标记；当前变换来自共享场景的静态实例数据。
+        ViewInstance history{known ? prev->second.world : item.world, {0, uint32_t(known), 0, 0}};
+        std::memcpy(static_cast<char*>(v.viewData->mapped) + i * sizeof(history), &history, sizeof(history));
+        if (!o.culling || visible(item.world, item.minimum, item.maximum, f.vp) ||
+            (o.taa && visible(item.world, item.minimum, item.maximum, rasterVP)))
             visibleList.push_back(i);
     }
     if (color && o.shadows)
-        fitShadows(f, camera, scene, v.tile);
+        fitShadows(f, camera, items, v.tile);
     // 静止时逐像素平均一个完整抖动周期，保留前景与背景各自的覆盖贡献。
     f.info.w = stationary ? (v.stillSamples < temporalSamples ? 1.f / (v.stillSamples + 1) : 0.f) : -1.f;
     std::memcpy(v.globals->mapped, &f, sizeof(f));
@@ -669,8 +750,8 @@ void Renderer::renderFrame(const SceneSnapshot& scene, const PerspectiveCamera& 
     check(vkBeginCommandBuffer(v.cmd, &bi), "begin frame");
     vkCmdBindDescriptorSets(v.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, v.pipe.meshLayout, 0, 1, &v.frame, 0, nullptr);
     if (color)
-        v.shadowPass(scene, packets, f, o.shadows);
-    v.geometryPass(packets, visibleList, false);
+        v.shadowPass(items, f, o.shadows);
+    v.geometryPass(items, visibleList, false);
     if (color)
     {
         std::array lightOutputs{v.hdr.get()};
@@ -682,27 +763,41 @@ void Renderer::renderFrame(const SceneSnapshot& scene, const PerspectiveCamera& 
     }
     // 传感器真值始终以无抖动的像素中心采样。
     if (o.taa && (o.readback || o.stableGeometry))
-        v.geometryPass(packets, visibleList, true);
+        v.geometryPass(items, visibleList, true);
     if (o.readback)
         v.copyOutputs();
     check(vkEndCommandBuffer(v.cmd), "end frame");
+    // 首次出现的资产上传与本帧在同一队列上，用时间线值声明提交依赖。
+    auto uploads = scene->uploads();
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    VkPipelineStageFlags uploadStage = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &v.cmd;
+    if (uploads)
+    {
+        timeline.waitSemaphoreValueCount = 1;
+        timeline.pWaitSemaphoreValues = &uploads;
+        si.pNext = &timeline;
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &impl->d.uploadTimeline;
+        si.pWaitDstStageMask = &uploadStage;
+    }
     check(vkResetFences(v.d.device, 1, &v.fence), "reset frame fence");
     check(vkQueueSubmit(v.d.queue, 1, &si, v.fence), "submit frame");
 
     v.lastVP = f.vp;
     v.stillSamples = stationary ? std::min(temporalSamples, v.stillSamples + 1) : unsigned(o.taa && !accumulate);
-    v.lastSun = scene.sun;
-    v.lastLights = scene.lights;
+    v.lastSun = snapshot.sun;
+    v.lastLights = snapshot.lights;
     v.lastShadows = o.shadows;
     v.lastModels = std::move(models);
     v.lastTaa = o.taa;
     v.lastChannel = o.debugChannel;
     v.hasReadback = o.readback;
     v.visibleCount = uint32_t(visibleList.size());
-    v.time = scene.time;
+    v.time = snapshot.time;
     ++v.number;
 }
 }

@@ -7,6 +7,10 @@
 
 namespace sim
 {
+namespace vk
+{
+class RenderScene;
+}
 struct DeviceOptions
 {
     std::vector<const char*> instanceExtensions;
@@ -65,6 +69,17 @@ struct RenderRequest
     std::vector<OutputDesc> outputs{{Channel::Color, Delivery::Cpu}};
     RenderOptions options;
 };
+// 资产与共享场景的准备计数，供集成方和测试观察共享行为。
+struct AssetStats
+{
+    uint64_t scenePreparations = 0;  // 新建共享场景版本次数
+    uint64_t sceneReuses = 0;        // 命中相同快照内容的次数
+    uint64_t meshUploads = 0;        // 网格缓冲上传次数，键为身份与版本
+    uint64_t textureUploads = 0;     // 贴图上传次数，键为身份、版本与色彩空间
+    uint64_t materialUploads = 0;    // 材质描述符集创建次数
+    uint64_t uploadBatches = 0;      // 已提交的上传批次数
+    uint32_t retiredGenerations = 0; // 仍在等待在途提交结束的旧缓存代际数
+};
 class Renderer
 {
   public:
@@ -74,14 +89,17 @@ class Renderer
     void render(const SceneSnapshot&, const PerspectiveCamera&, View&, const RenderOptions& = {});
     // 槽满时不等待结果的持有者，直接返回 Busy，避免调用线程自锁。
     Submission submit(const RenderRequest&);
+    // 只切换缓存代际，不销毁仍被在途提交引用的缓冲。
     void clearAssetCache();
+    AssetStats assetStats() const;
     const DeviceHandles& handles() const;
     VkSampler displaySampler() const;
 
   private:
     friend class View;
     friend class FrameResult;
-    void renderFrame(const SceneSnapshot&, const PerspectiveCamera&, View&, const RenderOptions&, bool color);
+    void renderFrame(const std::shared_ptr<vk::RenderScene>&, const SceneSnapshot&, const PerspectiveCamera&,
+                     View&, const RenderOptions&, bool color);
     struct Impl;
     std::shared_ptr<Impl> impl;
 };
