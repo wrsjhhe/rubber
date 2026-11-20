@@ -1,5 +1,19 @@
 # M4 独立审核
 
+## 最终复审：d3c0c1f（文档 177c579，2026-11-20）
+
+结论：**M4 在当前约定范围内通过验收，可进入 M5。** R-M4-001/003 保持关闭，R-M4-002 及 Hdr-only 补充关闭。本节取代下方历史需修改结论。
+
+核对历史提交路径：FrameGraph 保存活跃 pass 集；Renderer 以 temporalHandle 的编译存活状态确定 resolved，且在 execute、命令结束与 vkQueueSubmit 成功后才更新 View 状态并调用 commitHistory。MeshView/PointsView 声明阶段只写 pending 状态，resolved=false 不改变历史基线。Hdr-only 被裁剪的时序路径不再推进基线或历史槽；开启 TAA、保留时序副作用的路径仍正常推进。
+
+新增测试覆盖 Hdr-only 与 Color 穿插、点云变化、两模块历史基线及活跃时序 pass 判断。独立 Release 构建、七项 CTest、六项设备测试 --validation、Gallery smoke 全通过，控制台未见验证错误。TAA 误差仍为静止 28.623/6.28194、运动 347.217/293.813。
+
+本轮未独立重做缺陷注入与捕获图差异统计，未专门开启同步验证配置；无 debug messenger，结论不扩大到完整验证消息捕获或跨设备测试。点云上传暂存回收、逐点速度/阴影、显存预算和 display 与请求通道的公开契约继续作为后续事项。FrameGraph::executed 当前表示编译后存活，并非 GPU 完成；现有调用点通过成功提交后才提交历史正确区分了两者。
+
+本次仅修改审核文档，未改产品代码。
+
+---
+
 ## 复审：2b763cc（文档 1a1857f，2026-11-20）
 
 结论：仍需修改一处历史推进条件。R-M4-001 纯投影双轴焦距、R-M4-003 附件读取掩码已修复；无 HDR 时选择五附件管线及点云 SSBO 声明也已核对。R-M4-002 的一般颜色/几何请求已修复，但 Hdr-only 请求仍存在缺口。
