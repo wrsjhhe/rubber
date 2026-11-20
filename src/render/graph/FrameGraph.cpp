@@ -619,15 +619,46 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
             cell.lastWrite = image.initialized;
             cell.used = false;
         }
-    for (auto& buffer : buffers)
-        for (auto& segment : buffer.segments)
-        {
-            segment.state.layout = Layout::Undefined;
-            segment.state.stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-            segment.state.access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-            segment.state.defined = buffer.initialized;
-            segment.state.lastWrite = buffer.initialized;
-        }
+    // 缓冲的执行期状态与声明期段表分离：从导入声明独立建立一张覆盖整段缓冲的区间表，
+    // 并按所有活跃访问的边界预切分。声明期的段会为了压缩依赖把最终状态相同的相邻区间合并，
+    // 若直接在其上重放，一次局部访问就会改写未访问字节的状态（例如把未写的后半段标成已定义）。
+    std::vector<std::vector<Segment>> exec(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i)
+    {
+        auto& buffer = buffers[i];
+        if (!buffer.desc.size)
+            continue;
+        Segment whole;
+        whole.begin = 0;
+        whole.end = buffer.desc.size;
+        whole.state.layout = Layout::Undefined;
+        whole.state.stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        whole.state.access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+        whole.state.defined = buffer.initialized;
+        whole.state.lastWrite = buffer.initialized;
+        exec[i].push_back(whole);
+    }
+    auto splitExec = [&exec](uint32_t resource, uint64_t point)
+    {
+        auto& list = exec[resource];
+        for (size_t i = 0; i < list.size(); ++i)
+            if (list[i].begin < point && point < list[i].end)
+            {
+                auto tail = list[i];
+                tail.begin = point;
+                list[i].end = point;
+                list.insert(list.begin() + std::ptrdiff_t(i) + 1, tail);
+                return;
+            }
+    };
+    for (auto pass : seq)
+        for (auto& use : nodes[pass].uses)
+            if (!use.image)
+                for (auto& piece : use.pieces)
+                {
+                    splitExec(use.resource, piece.first);
+                    splitExec(use.resource, piece.second);
+                }
     auto barrierFor = [](bool image, uint32_t resource, const Subresource& sub, const BufferRange& range,
                          const Cell& from, Layout target, StageAccess to)
     {
@@ -680,30 +711,29 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
             else
             {
                 auto& buffer = buffers[use.resource];
-                // 缓冲逐区间判定：只声明写了一半的缓冲，另一段仍是未定义内容。
-                // 段可能在声明结束后被合并，因此按"与区间相交"遍历，而不是按精确边界查找。
+                // 边界已按全部访问预切分，所以每个 piece 都是若干完整段的并集：
+                // 状态更新只落在真正被访问的字节上，未访问的字节保持自己的历史状态。
                 for (auto& piece : use.pieces)
-                {
-                    for (auto& segment : buffer.segments)
+                    for (auto& segment : exec[use.resource])
                     {
-                        auto from = std::max(piece.first, segment.begin);
-                        auto to = std::min(piece.second, segment.end);
-                        if (from >= to)
+                        if (segment.begin < piece.first || segment.end > piece.second)
                             continue;
+                        // 未初始化读取只在活跃 pass 上诊断，避免被裁掉的声明报错。
                         if (!use.write && !segment.state.defined)
                             throw std::logic_error("Frame graph pass '" + nodes[pass].name +
                                                    "' reads uninitialized buffer " + buffer.name);
                         auto hazard = use.write ? (segment.state.defined || segment.state.lastWrite)
                                                 : segment.state.lastWrite;
                         if (hazard)
-                            entry.barriers.push_back(barrierFor(false, use.resource, {}, {from, to - from},
-                                                                segment.state, Layout::Undefined, stage));
+                            entry.barriers.push_back(
+                                barrierFor(false, use.resource, {},
+                                           {segment.begin, segment.end - segment.begin}, segment.state,
+                                           Layout::Undefined, stage));
                         segment.state.stage = stage.stage;
                         segment.state.access = stage.access;
                         segment.state.lastWrite = use.write;
                         segment.state.defined = segment.state.defined || use.write;
                     }
-                }
             }
         }
         compiled.push_back(std::move(entry));
@@ -736,17 +766,19 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
     for (auto& image : images)
         if (image.restored && !image.exported)
             transition(image, image.restoreLayout);
-    for (auto& buffer : buffers)
+    for (size_t i = 0; i < buffers.size(); ++i)
     {
+        auto& buffer = buffers[i];
         if (!buffer.exported)
             continue;
         auto stage = stageAccess(Access::HostRead);
-        auto resource = uint32_t(&buffer - buffers.data());
-        // 只对本次真正写过的段收尾，未触碰的字节不产生屏障。
-        for (auto& segment : buffer.segments)
+        // 只对本次真正写过的区间收尾，未触碰的字节不产生屏障；
+        // 范围取执行期区间表的真实边界，不会覆盖中间未写的空洞。
+        for (auto& segment : exec[i])
             if (segment.state.lastWrite)
-                final.push_back(barrierFor(false, resource, {}, {segment.begin, segment.end - segment.begin},
-                                           segment.state, Layout::Undefined, stage));
+                final.push_back(barrierFor(false, uint32_t(i), {},
+                                           {segment.begin, segment.end - segment.begin}, segment.state,
+                                           Layout::Undefined, stage));
     }
 }
 void FrameGraph::record(VkCommandBuffer cmd, const Barrier& barrier)

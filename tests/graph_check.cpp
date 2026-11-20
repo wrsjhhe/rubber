@@ -502,6 +502,99 @@ try
         expect(graph.activePasses() == std::vector<std::string>{"hold", "overwrite"},
                "Cross-range buffer WAR edge was lost");
     }
+    // 缓冲：局部写 + 读另一半 + 整体覆写。声明期两段最终状态相同会被合并，
+    // 执行期若复用合并后的段状态，读取未写的后半段就会被误判为已定义。
+    // 写入者带独立副作用（同时写回持久缓冲），因此不会被覆写裁掉，且必定在读取之前执行。
+    {
+        FrameGraph graph;
+        auto scratch = graph.createBuffer(
+            "scratch", {64, BufferUsage::Storage | BufferUsage::TransferDst | BufferUsage::HostRead});
+        auto low = graph.reserve("write-low"), high = graph.reserve("read-high"), cover = graph.reserve("overwrite");
+        graph.addPass(
+            low,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.write(scratch, Access::CopyDestination, {0, 32});
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            high,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(scratch, Access::StorageRead, {32, 32});
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(cover, [&](FrameGraph::Declaration& d) { d.write(scratch, Access::CopyDestination, {0, 0}); },
+                      [](VkCommandBuffer) {});
+        graph.exportBuffer(scratch);
+        expectThrow([&] { graph.compile(); }, "reads uninitialized buffer scratch");
+    }
+    // 缓冲：完整写入后分段以不同访问方式读取，再整体覆写。每段的屏障源状态
+    // 必须来自该段自己的最后一次访问，而不是被合并段上的某一个状态统一覆盖。
+    {
+        FrameGraph graph;
+        auto usage = BufferUsage::Storage | BufferUsage::TransferSrc | BufferUsage::TransferDst |
+                     BufferUsage::Uniform | BufferUsage::HostRead;
+        auto staging = graph.importBuffer("staging", {64, usage}, false);
+        auto fill = graph.reserve("fill"), head = graph.reserve("sample-head"), mid = graph.reserve("copy-mid"),
+             tail = graph.reserve("uniform-tail"), cover = graph.reserve("overwrite");
+        graph.addPass(fill, [&](FrameGraph::Declaration& d) { d.write(staging, Access::CopyDestination, {0, 0}); },
+                      [](VkCommandBuffer) {});
+        graph.addPass(
+            head,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(staging, Access::StorageRead, {0, 16});
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            mid,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(staging, Access::CopySource, {16, 16});
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            tail,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(staging, Access::UniformRead, {32, 32});
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(cover, [&](FrameGraph::Declaration& d) { d.write(staging, Access::CopyDestination, {0, 0}); },
+                      [](VkCommandBuffer) {});
+        graph.exportBuffer(staging);
+        graph.compile();
+        const CompiledPass* entry = nullptr;
+        for (auto& pass : graph.passes())
+            if (pass.name == "overwrite")
+                entry = &pass;
+        expect(entry != nullptr, "Overwrite pass did not survive culling");
+        // 三段各自一个屏障，源访问分别来自存储读、传输读与 uniform 读。
+        struct Source
+        {
+            uint64_t offset = 0, size = 0;
+            VkAccessFlags access = 0;
+            bool operator==(const Source&) const = default;
+        };
+        std::vector<Source> sources, expected{{0, 16, VK_ACCESS_SHADER_READ_BIT},
+                                              {16, 16, VK_ACCESS_TRANSFER_READ_BIT},
+                                              {32, 32, VK_ACCESS_UNIFORM_READ_BIT}};
+        for (auto& barrier : entry->barriers)
+            sources.push_back({barrier.range.offset, barrier.range.size, barrier.srcAccess});
+        expect(sources == expected, "Merged range lost the per-segment source state of the overwrite barriers");
+        // 导出收尾按执行期真实边界分段，所有本帧写过的字节都被交给宿主。
+        uint64_t covered = 0;
+        for (auto& barrier : graph.finalBarriers())
+            if (!barrier.image)
+                covered += barrier.range.size;
+        expect(covered == 64, "Buffer export did not hand over every byte written this frame");
+    }
     std::cout << "PASS: frame graph culling, diagnostics, subresources and import/export\n";
     return 0;
 }
