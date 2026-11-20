@@ -1,8 +1,9 @@
 #version 450
 #include "frame.glsl"
 layout(location=0) in vec2 uv;
-layout(location=0) out vec4 history;
-layout(location=1) out vec4 display;
+// 时序解析：把当前抖动样本与历史合成到固定像素中心，输出线性颜色与米制深度。
+// 颜色变换由后续 color pass 负责，两步之间不再耦合。
+layout(location=0) out vec4 resolved;
 layout(set=1,binding=0) uniform sampler2D hdr;
 layout(set=1,binding=1) uniform sampler2D velocity;
 layout(set=1,binding=2) uniform sampler2D metric;
@@ -85,8 +86,5 @@ void main() {
         else
             c=movingResolve(pixel,motion,depth);
     }
-    history=vec4(c,depth);
-    vec3 x=c*frame.settings.x;
-    vec3 mapped=frame.settings.w==0 || frame.settings.w==4 ? clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14),0,1):clamp(c,0,1);
-    display=vec4(mix(12.92*mapped,1.055*pow(mapped,vec3(1./2.4))-.055,step(.0031308,mapped)),1);
+    resolved=vec4(c,depth);
 }

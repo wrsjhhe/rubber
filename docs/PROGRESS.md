@@ -1,5 +1,11 @@
 # 实现进度
 
+## 最新状态（2026-11-20 / dev M3 提交）
+
+**M3 已实现，待审核。** 帧图（`src/render/graph/`）把资源声明与 Vulkan 分配/布局彻底分开：pass 只声明"读/写哪个资源的哪个子资源，用哪类访问"，编译期完成反向裁剪、拓扑排序、RAW/WAR/WAW 依赖推导和屏障生成，执行期才翻译成 `vkCmdPipelineBarrier`。渲染拆成历史清除、阴影、几何、光照、时序解析、颜色变换、读回七类可独立裁剪的 pass，`shaders/resolve.frag` 拆为 `temporal.frag` + `color.frag`。
+
+本轮验证：Release 构建通过；六项 CTest 全通过（新增 graph_check、pass_check）；五项 `--validation` 各 0 条校验错误（含 gallery）；`gallery --capture` 与 `example/preview/courtyard.png` 差异 37472/4096000 字节（0.915%），`max_delta=1`、`mean_delta=1`，仅 ±1 LSB 舍入；`temporal_check` 静止误差 raw=28.623 / TAA=6.28194 逐位不变，运动轮廓 347.217 / 293.813（上一轮 293.259，差异来自 temporal 与 color 拆成两个 pass 的浮点顺序）。缺项见下方 M3 交接记录，不计为已验收。
+
 ## 最新验收结论（2026-11-20 / 278371f）
 
 **M2 已验收，可进入 M3。** R-M2-001 包围盒可写入口已封闭，四项审核问题全部关闭。独立 Release 构建、四项 CTest、四项 --validation、Gallery smoke 通过；Gallery 捕获与仓库参考图 SHA256 一致。详见 [最终复审](REVIEW_M2.md)。下方旧的“需修改/待审核”记录仅保留为历史，本节为当前状态。上传限流、同代际驱逐、性能和跨设备测试不在本次验收结论内。
@@ -25,11 +31,12 @@ Release、四项 CTest、asset_check --validation、Gallery smoke 独立通过�
 | 功能 | 状态与位置 | 缺项/限制 |
 |---|---|---|
 | F01/F02 | 已有实现，待独立审核；Scene.hpp、src/scene、src/assets/Gltf.cpp | 静态不透明导入子集；资产版本与共享场景见下方“F02 缓存拆分”行 |
-| F03/F04 | 已有实现，待审核；Renderer.cpp、Pipeline.cpp、shaders、temporal_check | 固定 pass；resolve 合并颜色变换；动态效果失效协议未实现 |
+| F03/F04 | 已有实现，待审核；Renderer.cpp、Pipeline.cpp、shaders、render/passes、temporal_check | 帧图驱动的七类 pass；动态效果失效协议未实现；光照仍单次直射+点光，无阴影滤波选择 |
 | F05/F06 | 已有实现，待审核；Output.hpp、Renderer.hpp、VulkanInterop.hpp、request_check | 三份结果上限，导出复制，同 View 串行；旧 API 仍为最近帧 |
 | F05 几何路径 | 已有实现，待审核；submit/renderFrame | 跳过光照/TAA，新 View 不建颜色历史；仍写五个 G-buffer，用过颜色的 View 保留颜色资源 |
 | F02 缓存拆分 | 已有实现，待二次复审；render/RenderScene.hpp、render/RenderScene.cpp、assets/AssetCache.hpp、backend/Device.hpp、tests/asset_check.cpp | 场景准备仍在调用线程录制；实例缓冲按快照版本重新分配，未跨版本复用；上传批未限流 |
-| F07/F08 | 待开发 | 无通用帧图及 mesh/points 模块协议 |
+| F07 帧图 | 已有实现，待审核；render/graph/FrameGraph.hpp、FrameGraph.cpp、tests/graph_check.cpp | 单队列顺序执行；保守屏障（每 pass 保守 stage/access，不做合并优化）；瞬时资源按描述缓存复用，未做显存别名 |
+| F08 | 待开发 | 无 mesh/points 模块协议，几何通道仍是单一 opaques 列表 |
 | F09 | 部分实现 | 已有内参、时间、真值输出和互操作头；无独立 Observation/sensors/presentation |
 | F10 | 待开发 | 无 install/export/find_package 验证 |
 | F11—F17 | 未实现 | 后续规划，不列为已支持 |
@@ -42,7 +49,7 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 |---|---|---|---|
 | M1 | 已有实现，待审核 | F05/F06 请求、结果、槽位、互操作 | 双相机、旧结果不变、Busy/恢复、销毁 View/Renderer 后读取、非法请求及 GPU 寿命 |
 | M2 | M1；已有实现，待二次复审 | RenderScene、共享静态实例数据、不可变资产版本、上传依赖、延迟回收 | asset_check：同快照两相机准备与上传各一次、旧快照在原对象被修改后与清缓存后仍重现原画面、身份不复用、静止收敛后换贴图的 Color 更新、上传批与暂存回落、旧代际最终回收、渲染输入只读的编译期断言 |
-| M3 | M2；待开发 | 帧图及六类独立 pass，资源声明与分配分离 | 未初始化读取/循环/冲突诊断；图像子资源/缓冲依赖；导入/导出；按需活跃 pass 清单；validation |
+| M3 | M2；已有实现，待审核 | 帧图及六类独立 pass，资源声明与分配分离 | graph_check：裁剪、未初始化读取、同 pass 读写冲突、循环依赖、子资源屏障、缓冲字节范围、usage 诊断、导出终态；pass_check：按输出通道断言活跃 pass 清单（含首帧历史清除与状态变化后的重建）；六项 CTest 与五项 --validation
 | M4 | M3；待开发 | 网格模块迁移、协议和点云 | 双相机下点/网格前后遮挡；主调度无点云分支；强度/半径保留；深度/ID 语义明确 |
 | M5 | M4；待开发 | Observation、处理链入口、呈现隔离、互操作边界 | Beauty+调试同帧不串色；校准/时间一致；真值独立；无需实现全部 F11—F13 即可验收框架 |
 | M6 | M5；待开发 | 安装头文件/库/shader、导出 target/依赖 | 新安装前缀的外部项目 find_package 构建并离屏运行，不访问原源码/构建目录；关闭 example 可构建 |
@@ -51,15 +58,60 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 
 ## 已有验证与缺口
 
+本轮（M3）：Release 构建成功；sensor_check、temporal_check、request_check、asset_check、pass_check、graph_check 六项 CTest 全通过；sensor/temporal/request/asset/pass 五项分别以 `--validation` 运行，均 0 条校验错误；gallery `--smoke --validation` 与 `--capture --validation` 退出 0、0 条校验错误；`gallery --capture` 与 example/preview/courtyard.png 差异 37472/4096000 字节（0.915%），`max_delta=1`、`mean_delta=1`；temporal_check 静止误差 raw=28.623、TAA=6.28194 与 M2 逐位相同，运动轮廓 347.217/293.813（M2 为 293.259，源于 temporal 与 color 拆成两个 pass 的浮点累加顺序）。graph_check 不需要设备，可在无 GPU 机器上跑裁剪与诊断。
+
 上一批：Release 构建成功；sensor_check、temporal_check、request_check 三项 CTest 通过；request_check --validation 和 gallery --smoke --validation 通过。参考环境 Windows、RTX 3080 Ti；精确驱动和完整日志尚未归档，不宣称跨设备验证。
 
 本轮（M2 修复 + 复审追加）：Release 构建成功，构建新增显式 `/EHsc`，此前 asset_check 的 C4530 警告消失；sensor_check、temporal_check、request_check、asset_check 四项 CTest 通过；四项分别以 --validation 运行完成；gallery --smoke --validation 通过；gallery --capture 输出仍与 example/preview/courtyard.png 字节一致（MD5 356ab30b5a9ba71818e38eec7babd280），temporal_check 误差数值与改动前相同（raw=28.623、TAA=6.28194、移动轮廓 347.217/293.259），说明资产模型重构与包围盒只读化未改变画面。参考环境同上一批，驱动版本仍未归档。
 
 缺陷注入核对：把 TAA 历史比较临时放宽为只比几何与变换（去掉材质与贴图身份）后，asset_check 在"Texture swap kept frozen TAA history"处失败；把几何包围盒改回可变成员后，asset_check 以 `static_assert failed: 'Bounds are mutable'`（C2338）编译失败。两处用例因此确认有效，均已还原。
 
-尚缺按需 pass/显存分配自动证据、全部通道/交付组合，以及帧图/点云/安装测试。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。
+尚缺显存分配自动统计证据、多队列/异步计算路径、显存别名复用，以及点云/安装测试。活跃 pass 清单已由 pass_check 按输出通道逐项断言，但只覆盖本仓库现存的通道组合，未覆盖全部请求×交付×选项组合。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。
 
 ## 交接记录
+
+### M3 / F07 帧图与六类独立 pass
+
+任务编号 / 功能编号：M3 / F07（帧图），关联 F03/F04
+负责人 / 日期 / 状态：开发者 / 2026-11-20 / 待审核
+代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支"M3：帧图与六类独立 pass"提交
+修改文件 / 接口变化：
+- 新增 `src/render/graph/FrameGraph.hpp`、`src/render/graph/FrameGraph.cpp`：声明层枚举 `Format/Aspect/Layout/Access/ImageUsage/BufferUsage`、`ImageHandle/BufferHandle/PassHandle`、`Subresource{mip,mipCount,layer,layerCount}`、`BufferRange{offset,size}`、`Barrier`、`CompiledPass`、`Transient`；`Declaration::read/write`（图像与缓冲各自重载）、`after()`、`sideEffect()`；`importImage/importBuffer`（声明初始布局与是否已初始化）、`createImage/createBuffer`（瞬时）、`exportImage/exportBuffer`（裁剪根，声明终态布局）、`restoreImage`（非裁剪根，仅回写布局）、`reserve/addPass/bind/compile/execute/reset`；观察接口 `activePasses()/passes()/finalBarriers()/transients()/barrierCount()/names()`
+- 新增 `src/render/FrameData.hpp`：从 Renderer.cpp 抽出的 `Globals`（1072 字节，`static_assert` 锁布局）、`Draw`、`temporalSamples`、`halton`、`sameLights`、`corners`、`sceneKey`、`fitShadows`
+- 新增 `src/render/passes/Passes.hpp` 与 `ShadowPass.cpp`、`GeometryPass.cpp`、`LightingPass.cpp`、`TemporalPass.cpp`、`ColorPass.cpp`、`ReadbackPass.cpp`：每个 pass 只录制绘制，不做隐式布局转换
+- 新增 `shaders/temporal.frag`（原 `resolve.frag` 的 TAA 逻辑，输出 `vec4(color, depth)`）、`shaders/color.frag`（曝光、色调映射、sRGB 编码）；删除 `shaders/resolve.frag`
+- `src/render/Pipeline.hpp/.cpp`：新增 `colorSet` 描述符布局、`colorLayout`、`color` 管线（`color.frag` → `colorFormat`）；`temporal` 管线改用 `temporal.frag`；`beginPass` 不再做隐式 transition
+- `src/render/Renderer.cpp`：每帧 `reset` → `importImage/importBuffer`（由物理 `VkImageLayout` 换算成声明层 `Layout`）→ `bind` → `reserve/addPass` → 导出/恢复 → `compile` → 按 `transients()` 分配或复用 → `execute`；新增 `transientImage/transientBuffer/beginTransients/sweepTransients`；颜色相关资源仅在请求颜色时导入与绑定；图像分配用的 `VkImageUsageFlags` 统一由 `vkUsageOf(声明用法常量)` 推导，避免声明与分配各写一份而漂移
+- `include/sim/Renderer.hpp`：`View::activePasses()`；`renderFrame(..., bool color, const std::vector<Channel>& exports)`
+- 新增 `tests/graph_check.cpp`（不需要设备）、`tests/pass_check.cpp`、`tools/pngdiff.py`（纯 Python PNG 差异统计）
+- `CMakeLists.txt`：shader 列表改为 `geometry.vert geometry.frag shadow.vert fullscreen.vert lighting.frag temporal.frag color.frag`；`renderer` 增加帧图与六个 pass 源文件；新增 `pass_check`、`graph_check` 两个 CTest
+已完成：
+- 声明与分配分离：pass 体内不出现 `VkImageLayout`/`VkAccessFlags`，布局与访问由帧图在编译期推导；`ensureColor()` 只申请内存，不再决定布局
+- 反向裁剪：`exportImage/exportBuffer` 与 `sideEffect()` 是根，从请求输出反推执行集；GPU 交付的导出同样是根，不会被误裁（pass_check 断言）
+- 诊断：未初始化读取、同一 pass 读写同一资源（反馈冲突）、写用只读访问、声明用法与访问不匹配、depth/color aspect 误用、循环依赖（报错信息列出参与循环的 pass 名单）
+- 依赖：RAW/WAW 由最近的写入者串联，WAR 用"自上次写入以来的读取者"快照生成边并阻止调度器前移；按子资源 cell（mip × layer）与缓冲字节范围求交，不相关子资源不产生依赖
+- 持久资源语义：导入声明初始布局与是否已初始化；导出声明终态布局并作为裁剪根；`restoreImage` 只回写布局、不作为根，供历史槽在帧末回到下一帧导入声明的布局
+- 执行：编译出"每 pass 前置屏障 + 帧末导出/恢复屏障"，`execute` 翻译成 `vkCmdPipelineBarrier` 并回写物理布局；屏障数量可经 `barrierCount()` 检查
+- 六类独立 pass：Shadow → Geometry → Lighting → TemporalResolve → ColorTransform，加 Readback 与历史清除（`history.clear`）；每个 pass 可用 `activePasses()` 单独可见
+- 历史语义修正：只有真正写入历史的帧才推进历史状态与槽奇偶（`historyNumber`），几何真值与 GPU 交付请求不再让 TAA 历史失效；光照/阴影/通道变化仍按原协议作废历史
+仍缺项：
+- 单图形队列顺序执行，未做多队列或异步计算，屏障未按队列拆分
+- 屏障保守：每个 pass 对声明过的资源各发一次屏障，子资源场景存在整图退化，未做屏障合并与去重优化
+- 瞬时资源按描述缓存复用，未做显存别名（不同寿命资源共用同一块内存）
+- 没有自动的显存占用/分配次数统计，只能从 `transients()` 列表外部检查
+- 活跃 pass 清单的断言只覆盖仓库现有通道 × 交付 × 选项组合，未穷举
+- 历史失效仍是一次整槽 `vkCmdClearColorImage`，未做按区域局部失效
+- 场景准备仍在调用线程同步录制；上传批未限流（沿用 M2 缺项）
+环境 / 精确构建测试命令：Windows、Visual Studio 2022 x64、Vulkan SDK 1.4.357.0、RTX 3080 Ti
+- `cmake -S . -B build-dev`；`cmake --build build-dev --config Release`
+- `ctest --test-dir build-dev -C Release --output-on-failure`
+- `sensor_check|temporal_check|request_check|asset_check|pass_check --validation`
+- `gallery --smoke --validation`；`gallery --capture build-dev/m3-capture.png --validation`
+- `python tools/pngdiff.py build-dev/m3-capture.png example/preview/courtyard.png`
+结果 / 日志截图位置：六项 CTest 全通过；五项 `--validation` 均 0 条校验错误；gallery 两种模式均 0 条；`pass_check` 输出 "PASS: frame graph culls passes to the requested outputs"；`graph_check` 输出裁剪与诊断断言全通过；捕获图与仓库预览图差异 37472/4096000 字节（0.915%），`max_delta=1`、`mean_delta=1`
+性能和画质对比：temporal_check 静止误差 raw=28.623、TAA=6.28194 与 M2 逐位相同；运动轮廓 347.217/293.813（M2 为 293.259），差异源于 temporal 与 color 由同一 pass 拆成两个 pass 后的浮点累加顺序，不是逻辑变化；未做性能测量，无帧时间对比
+已知问题 / 下一步：等待审核；审核通过后进入 M4（网格模块迁移、协议与点云）。审核若要求性能数据，建议先补帧图屏障统计（`barrierCount()` 已有）与 pass 级 GPU 计时
+审核人 / 审核版本 / 结论 / 问题编号：待填
 
 ### M2 复审追加修复 / F02（回应 R-M2-001 补充）
 

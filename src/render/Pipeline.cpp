@@ -120,6 +120,7 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
     material = setLayout(3, false);
     lighting = setLayout(7, false);
     resolve = setLayout(4, false);
+    colorSet = setLayout(1, false);
     auto layout = [&](VkDescriptorSetLayout second)
     {
         VkDescriptorSetLayout sets[] = {frame, second};
@@ -137,12 +138,16 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
     meshLayout = layout(material);
     lightLayout = layout(lighting);
     resolveLayout = layout(resolve);
+    colorLayout = layout(colorSet);
     shadow = graphicsPipeline(d, life, dir, "shadow.vert", nullptr, meshLayout, {}, true, true);
     geometry = graphicsPipeline(d, life, dir, "geometry.vert", "geometry.frag", meshLayout, gFormats, true, false);
     shade = graphicsPipeline(d, life, dir, "fullscreen.vert", "lighting.frag", lightLayout, std::array{hdrFormat},
                              false, false);
-    temporal = graphicsPipeline(d, life, dir, "fullscreen.vert", "resolve.frag", resolveLayout,
-                                std::array{hdrFormat, colorFormat}, false, false);
+    temporal =
+        graphicsPipeline(d, life, dir, "fullscreen.vert", "temporal.frag", resolveLayout, std::array{hdrFormat},
+                         false, false);
+    color = graphicsPipeline(d, life, dir, "fullscreen.vert", "color.frag", colorLayout, std::array{colorFormat},
+                             false, false);
     auto sampler = [&](VkFilter filter, VkSamplerAddressMode mode)
     {
         VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -213,12 +218,10 @@ void viewport(VkCommandBuffer cmd, int x, int y, uint32_t w, uint32_t h)
     vkCmdSetViewport(cmd, 0, 1, &v);
     vkCmdSetScissor(cmd, 0, 1, &s);
 }
-void beginPass(VkCommandBuffer cmd, std::span<Image*> colors, Image* depth)
+void beginPass(VkCommandBuffer cmd, std::span<Image* const> colors, Image* depth)
 {
-    auto attach = [&](Image* img, bool z)
+    auto attach = [](Image* img, bool z)
     {
-        img->transition(cmd, z ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
-                               : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         a.imageView = img->view;
         a.imageLayout = img->layout;

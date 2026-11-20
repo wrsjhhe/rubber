@@ -23,7 +23,7 @@ OutputInfo 给出尺寸、格式、行字节数。新增点云/高斯输出须�
 
 ## 渲染与时序
 
-目标路径为 Shadow → Geometry → Lighting → TemporalResolve → ColorTransform。当前 resolve 合并最后两步，待拆分。GGX 金属粗糙度模型；底色纹理解码 sRGB，法线/金属粗糙度按线性数据。四级 CSM 使用 texel 对齐和比较滤波，阴影剔除按光源视锥。
+目标路径为 Shadow → Geometry → Lighting → TemporalResolve → ColorTransform。当前已按此拆分：`geometry` 写五个 G-buffer 与硬件深度，`shadow` 写 CSM 深度图，`lighting` 写 HDR，`temporal` 读 HDR/速度/米制深度与旧历史、写本帧历史槽并输出线性颜色+深度，`color` 做曝光、色调映射与 sRGB 编码，`readback` 复制真值，历史失效时另有 `history.clear`。GGX 金属粗糙度模型；底色纹理解码 sRGB，法线/金属粗糙度按线性数据。四级 CSM 使用 texel 对齐和比较滤波，阴影剔除按光源视锥。
 
 颜色允许抖动，几何真值按固定像素中心采样；当前必要时额外绘制稳定几何 pass。TAA 静止积累 16 个 Halton 样本，运动采用速度重投影和深度拒绝。静止冻结只适用于所有贡献均不随时间变化的场景，雨雪等必须声明动态失效。
 
@@ -44,6 +44,8 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 资源声明与 Vulkan 分配分离。描述纹理 mip/layer/aspect、缓冲字节范围和访问类型；跟踪 RAW/WAR/WAW，诊断未初始化读取、循环依赖、冲突声明。持久资源导入声明初始状态，导出声明最终状态和所有权。
 
 从请求输出、必要历史写回和副作用反向裁剪；不能误裁 GPU 输出。编译执行顺序、屏障及首末使用点。首版单队列、保守分配，别名复用和多队列后续优化。仅包装固定调用不能算完成帧图。
+
+当前实现：`src/render/graph/FrameGraph.hpp` 的声明层用 `Layout`/`Access`/`ImageUsage`/`BufferUsage` 描述意图，pass 体内不出现 `VkImageLayout`/`VkAccessFlags`；`Subresource{mip,mipCount,layer,layerCount}` 与 `BufferRange{offset,size}` 让依赖按子资源求交。`compile()` 依次做校验、反向裁剪（`exportImage/exportBuffer` 与 `sideEffect` 为根）、拓扑排序（RAW/WAW 串写者，WAR 用读取者快照建边并阻止调度器前移）、屏障规划；`execute()` 才翻译成 `vkCmdPipelineBarrier` 并回写物理布局。导入声明初始布局与是否已初始化，导出声明终态布局并作为裁剪根，`restoreImage` 只回写布局、不作根，供跨帧复用的历史槽使用。`Renderer.cpp` 每帧重建声明，再按 `transients()` 分配或复用瞬时资源；槽奇偶与历史有效性只随真正写入历史的帧推进，几何真值与 GPU 交付请求不再使 TAA 历史失效。有效 pass 清单经 `View::activePasses()` 对外可见，`tests/pass_check.cpp` 按输出通道逐项断言，`tests/graph_check.cpp` 在无设备条件下覆盖裁剪与诊断。
 
 模块负责资产准备、类型批次、可见性、资源/pass 注册、输出语义和历史失效。点云有自己的数据和绘制实现，公共调度只调用协议。
 

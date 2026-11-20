@@ -20,7 +20,7 @@
 | src/presentation | 调试输出、显示转换 | 改写其他消费者的颜色 |
 | example | GLFW/ImGui 应用和资产 | 成为核心库必需依赖 |
 
-无需提前创建空目录。Scene 的 mesh 专用字段通过兼容适配逐步迁移；点云不能被要求伪装成三角网格。
+无需提前创建空目录。Scene 的 mesh 专用字段通过兼容适配逐步迁移；点云不能被要求伪装成三角网格。截至 M3，`src/render/graph` 与 `src/render/passes` 已按表中职责存在：帧图只做声明、裁剪、依赖与屏障推导，不接触材质或点云语义；每个 pass 只录制自己的绘制，不隐式转换未声明的资源。`src/modules`、`src/sensors`、`src/presentation` 仍未实现。
 
 ## 所有权
 

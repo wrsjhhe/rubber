@@ -54,6 +54,8 @@ class View
     VkImageView colorView() const;
     VkImageView imageView(Channel channel) const;
     uint32_t visibleMeshes() const;
+    // 上一帧帧图实际执行的 pass 清单（按执行顺序），用于确认按需裁剪。
+    const std::vector<std::string>& activePasses() const;
 
   private:
     friend class Renderer;
@@ -101,7 +103,7 @@ class Renderer
     friend class View;
     friend class FrameResult;
     void renderFrame(const std::shared_ptr<vk::RenderScene>&, const SceneSnapshot&, const PerspectiveCamera&,
-                     View&, const RenderOptions&, bool color);
+                     View&, const RenderOptions&, bool color, const std::vector<Channel>& exports);
     struct Impl;
     std::shared_ptr<Impl> impl;
 };

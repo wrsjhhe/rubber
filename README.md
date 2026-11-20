@@ -18,14 +18,16 @@ ctest --test-dir build -C Release --output-on-failure
 - `gallery --model path/to/asset.glb` 将静态不透明 glTF 模型放到展台上，也支持含外部缓冲和图片的 .gltf。
 - `gallery --capture image.png` 无窗口渲染并导出 PNG。可与 `--model` 组合。
 - `gallery --benchmark` 实测 1、4、8 个视图的批次耗时。每轮预热后统计 120 个批次，包含快照、录制、提交及最后一批 GPU 完成等待。
-- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除。validation 模式需要 SDK 验证层。
+- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断。validation 模式需要 SDK 验证层。
 - 仅编译引擎可传入 `-DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF`。嵌入其他程序时可用 `DeviceOptions::shaderDirectory` 指向生成的 SPIR-V 目录。当前 gallery 直接使用构建目录的着色器和源码目录的示例资产，移动可执行文件时需一并考虑这两个路径。
+- `python tools/pngdiff.py a.png b.png` 统计两张 PNG 的差异字节数、最大与平均通道差，用于核对捕获画面是否只差舍入。
 
 ## 特性清单
 
 | 范围 | 当前实现 |
 |---|---|
 | 场景与资产 | 有父子关系的 Object3D、局部到世界变换、稳定实例 ID、场景快照；同一快照由共享 RenderScene 承载，多相机共用网格、材质与静态实例数据，首次资产合并为一次上传并以时间线声明提交依赖 |
+| 帧图 | pass 只声明读写意图，帧图负责反向裁剪、RAW/WAR/WAW 依赖、子资源与缓冲范围求交、屏障推导；跨帧历史以持久导入/导出/恢复表达。阴影、几何、光照、时序解析、颜色变换、读回是彼此独立、可按请求裁剪的 pass |
 | 几何 | Box、Sphere、Cylinder、Cone、Capsule、点集 Convex、索引 TriangleMesh。各生成器输出统一 BufferGeometry |
 | 材质 | GGX 金属粗糙度模型、底色/法线/金属粗糙度纹理、sRGB 解码、mipmap、线性 HDR、色调映射。环境项使用解析天空近似 |
 | 光照 | 一盏方向光，最多 16 盏平方反比衰减点光。方向光采用四级 CSM、光空间 texel 对齐和 3×3 PCF |
@@ -64,7 +66,7 @@ auto frame = view->read();
 
 ## GPU 数据契约
 
-`View::imageView(Channel)` 暴露由视图持有的 VkImageView。附件在 render 提交完成后可按 SHADER_READ_ONLY_OPTIMAL 读取。外部消费者应使用相同设备，协调提交与资源生命周期。当前 Renderer 的录制、提交和缓存接口按单线程调用设计；场景快照可由调用方在仿真步边界生成后移交给渲染线程。仅由 GPU 消费时可打开 stableGeometry，获得像素中心的几何通道。TAA 与几何真值同时启用时，为保证采样位置会额外录制一次无抖动的几何 pass。
+`View::imageView(Channel)` 暴露由视图持有的 VkImageView。附件在 render 提交完成后可按 SHADER_READ_ONLY_OPTIMAL 读取。外部消费者应使用相同设备，协调提交与资源生命周期。当前 Renderer 的录制、提交和缓存接口按单线程调用设计；场景快照可由调用方在仿真步边界生成后移交给渲染线程。仅由 GPU 消费时可打开 stableGeometry，获得像素中心的几何通道。TAA 与几何真值同时启用时，为保证采样位置会额外录制一次无抖动的几何 pass。`View::activePasses()` 返回上一帧实际执行的 pass 名，可用来确认裁剪结果；几何真值或 GPU 交付请求不经过颜色链路，也不会让 TAA 历史失效。
 
 | 通道 | 格式与语义 |
 |---|---|
@@ -77,7 +79,7 @@ auto frame = view->read();
 
 ## 当前边界
 
-主要验证范围为 Windows、NVIDIA RTX 3080 Ti 和不透明静态三角网格，支持实例运动。图像畸变、按曝光时间积分的运动模糊、透明材质、骨骼动画、HDRI 预滤波 IBL、DLSS 和多 GPU 尚待扩展。TAA 负责抗锯齿。glTF 导入器读取静态姿态和上述核心材质子集，贴图使用 UV0 和重复采样；暂未覆盖完整的 glTF 材质扩展与采样器语义。
+主要验证范围为 Windows、NVIDIA RTX 3080 Ti 和不透明静态三角网格，支持实例运动。图像畸变、按曝光时间积分的运动模糊、透明材质、骨骼动画、HDRI 预滤波 IBL、DLSS 和多 GPU 尚待扩展。TAA 负责抗锯齿。glTF 导入器读取静态姿态和上述核心材质子集，贴图使用 UV0 和重复采样；暂未覆盖完整的 glTF 材质扩展与采样器语义。帧图目前单队列顺序执行、屏障偏保守、瞬时资源按描述缓存但不做显存别名，多队列与别名复用留待后续按实测优化。
 
 材质、贴图及网格在构造后即不可变，修改内容需以新对象重新发布；快照按值保存材质并持有几何与贴图的固定版本，所以旧快照不受后续修改影响。首次出现的资产在一次上传批内提交，帧提交等待该批的时间线值，不随相机数量增加重复上传；准备录制仍在调用线程完成。上传批完成后在正常准备路径回收，暂存副本随之释放，`assetStats()` 的 pendingUploads 与 stagingBytes 可观察该状态。切换大型场景后可用 clearAssetCache() 切换缓存代际，旧代际的缓冲仍被在途提交或视图引用时不会销毁，最后一个引用消失后才回收。后续可以从异步准备、上传限流、显存子分配和跨视图命令录制入手优化。
 

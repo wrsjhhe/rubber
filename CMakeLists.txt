@@ -15,7 +15,7 @@ FetchContent_Declare(stb URL https://codeload.github.com/nothings/stb/zip/f05691
 set(GLM_BUILD_LIBRARY OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glm stb)
 set(shader_outputs)
-foreach(shader geometry.vert geometry.frag shadow.vert fullscreen.vert lighting.frag resolve.frag)
+foreach(shader geometry.vert geometry.frag shadow.vert fullscreen.vert lighting.frag temporal.frag color.frag)
   set(output "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader}.spv")
   add_custom_command(OUTPUT "${output}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
@@ -24,7 +24,12 @@ foreach(shader geometry.vert geometry.frag shadow.vert fullscreen.vert lighting.
   list(APPEND shader_outputs "${output}")
 endforeach()
 add_custom_target(renderer_shaders DEPENDS ${shader_outputs})
-add_library(renderer src/scene/Scene.cpp src/assets/Gltf.cpp src/backend/Device.cpp src/render/Pipeline.cpp src/render/RenderScene.cpp src/render/Renderer.cpp)
+add_library(renderer
+  src/scene/Scene.cpp src/assets/Gltf.cpp src/backend/Device.cpp
+  src/render/Pipeline.cpp src/render/RenderScene.cpp src/render/graph/FrameGraph.cpp
+  src/render/passes/ShadowPass.cpp src/render/passes/GeometryPass.cpp src/render/passes/LightingPass.cpp
+  src/render/passes/TemporalPass.cpp src/render/passes/ColorPass.cpp src/render/passes/ReadbackPass.cpp
+  src/render/Renderer.cpp)
 add_dependencies(renderer renderer_shaders)
 target_include_directories(renderer PUBLIC include PRIVATE "${stb_SOURCE_DIR}" third_party/cgltf)
 target_link_libraries(renderer PUBLIC Vulkan::Vulkan glm::glm)
@@ -43,6 +48,13 @@ if(BUILD_TESTING)
   add_executable(asset_check tests/asset_check.cpp)
   target_link_libraries(asset_check PRIVATE renderer)
   add_test(NAME asset_check COMMAND asset_check)
+  add_executable(pass_check tests/pass_check.cpp)
+  target_link_libraries(pass_check PRIVATE renderer)
+  add_test(NAME pass_check COMMAND pass_check)
+  add_executable(graph_check tests/graph_check.cpp)
+  target_link_libraries(graph_check PRIVATE renderer)
+  target_include_directories(graph_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  add_test(NAME graph_check COMMAND graph_check)
 endif()
 if(RENDERER_EXAMPLE)
   set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)

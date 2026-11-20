@@ -15,9 +15,9 @@ struct Pipelines
 {
     Device& d;
     Lifetime life;
-    VkDescriptorSetLayout frame{}, material{}, lighting{}, resolve{};
-    VkPipelineLayout meshLayout{}, lightLayout{}, resolveLayout{};
-    VkPipeline shadow{}, geometry{}, shade{}, temporal{};
+    VkDescriptorSetLayout frame{}, material{}, lighting{}, resolve{}, colorSet{};
+    VkPipelineLayout meshLayout{}, lightLayout{}, resolveLayout{}, colorLayout{};
+    VkPipeline shadow{}, geometry{}, shade{}, temporal{}, color{};
     VkSampler point{}, linear{}, repeat{};
     explicit Pipelines(Device&, const std::filesystem::path&);
 };
@@ -26,5 +26,6 @@ VkDescriptorSet allocateSet(Device&, VkDescriptorPool, VkDescriptorSetLayout);
 void bindImage(Device&, VkDescriptorSet, uint32_t, const Image&, VkSampler);
 void bindBuffer(Device&, VkDescriptorSet, uint32_t, const Buffer&, VkDescriptorType);
 void viewport(VkCommandBuffer, int x, int y, uint32_t w, uint32_t h);
-void beginPass(VkCommandBuffer, std::span<Image*> colors, Image* depth);
+// 只按当前布局进入渲染：布局必须已由帧图转换好，pass 内不再做隐式转换。
+void beginPass(VkCommandBuffer, std::span<Image* const> colors, Image* depth);
 }
