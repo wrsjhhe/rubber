@@ -6,9 +6,25 @@
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 using namespace sim;
+namespace
+{
+template <typename T> constexpr bool readonly = std::is_const_v<std::remove_reference_t<T>>;
+// R-M2-001：渲染输入全部在构造时固定。包围盒是剔除与阴影范围的输入，必须与顶点
+// 同属不可变内容；任一成员改回可变，这里都会编译失败。
+static_assert(readonly<decltype(std::declval<const BufferGeometry&>().vertices)>, "Geometry is mutable");
+static_assert(readonly<decltype(std::declval<const BufferGeometry&>().indices)>, "Geometry is mutable");
+static_assert(readonly<decltype(std::declval<const BufferGeometry&>().minimum)>, "Bounds are mutable");
+static_assert(readonly<decltype(std::declval<const BufferGeometry&>().maximum)>, "Bounds are mutable");
+static_assert(readonly<decltype(std::declval<const BufferGeometry&>().id)>, "Asset identity is mutable");
+static_assert(readonly<decltype(std::declval<const Texture&>().rgba)>, "Texture is mutable");
+static_assert(readonly<decltype(std::declval<const Texture&>().width)>, "Texture is mutable");
+static_assert(readonly<decltype(std::declval<const Texture&>().height)>, "Texture is mutable");
+}
 void expect(bool condition, const char* message)
 {
     if (!condition)
@@ -93,6 +109,21 @@ try
     auto green = centerAlbedo(*fresh.frame);
     expect(green.g > 200 && green.r < 32, "Edited material not applied to the new snapshot");
     fresh.frame.reset();
+
+    // R-M2-001 补充：包围盒与顶点一起在构造时算定，没有可写的入口。让网格只有一部分
+    // 落在视锥内，剔除与阴影范围都必须按发布时的边界判断，重放快照仍能画出它。
+    auto tall = BoxGeometry(2, 4, 2);
+    expect(tall->minimum == glm::vec3(-1, -2, -1) && tall->maximum == glm::vec3(1, 2, 1),
+           "Bounds were not derived from the published vertices");
+    Scene bounded;
+    bounded.add(tall, *gray, glm::translate(glm::mat4(1), {0, 1.8f, 0}));
+    auto boundedSnapshot = bounded.snapshot(2);
+    for (int i = 0; i < 3; ++i)
+    {
+        auto frame = renderer.submit({boundedSnapshot, camera, *near, {{Channel::MetricDepth, Delivery::Cpu}}});
+        expect(std::abs(centerDepth(*frame.frame) - 4.f) < .01f, "Partially visible mesh was culled");
+        frame.frame.reset();
+    }
 
     // R-M2-004：资产身份在构造时分配且不复用。释放一个几何后新建同尺寸分配的对象，
     // 必须重新上传并按新内容绘制，不能命中旧缓冲。

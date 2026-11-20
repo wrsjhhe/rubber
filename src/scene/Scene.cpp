@@ -64,19 +64,37 @@ Geometry lathe(const std::vector<Ring>& rings, unsigned segments)
     return TriangleMeshGeometry(std::move(v), std::move(idx));
 }
 }
-BufferGeometry::BufferGeometry(std::vector<Vertex> v, std::vector<uint32_t> i)
-    : vertices(std::move(v)), indices(std::move(i))
+// 包围盒与几何内容一起在构造时算定：它是渲染侧剔除和阴影范围的输入，
+// 与顶点同等属于不可变内容，不能由调用方在发布后修改。
+struct BufferGeometry::Baked
 {
-    require(!vertices.empty() && !indices.empty() && indices.size() % 3 == 0, "Expected indexed triangles");
-    minimum = maximum = vertices.front().position;
-    for (auto& vertex : vertices)
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    glm::vec3 minimum{}, maximum{};
+};
+BufferGeometry::Baked BufferGeometry::bake(std::vector<Vertex> v, std::vector<uint32_t> i)
+{
+    require(!v.empty() && !i.empty() && i.size() % 3 == 0, "Expected indexed triangles");
+    Baked baked{std::move(v), std::move(i)};
+    baked.minimum = baked.maximum = baked.vertices.front().position;
+    for (auto& vertex : baked.vertices)
     {
         require(finite(vertex.position) && finite(vertex.normal), "Non-finite vertex");
-        minimum = glm::min(minimum, vertex.position);
-        maximum = glm::max(maximum, vertex.position);
+        baked.minimum = glm::min(baked.minimum, vertex.position);
+        baked.maximum = glm::max(baked.maximum, vertex.position);
     }
-    for (auto index : indices)
-        require(index < vertices.size(), "Index outside mesh");
+    for (auto index : baked.indices)
+        require(index < baked.vertices.size(), "Index outside mesh");
+    return baked;
+}
+BufferGeometry::BufferGeometry(std::vector<Vertex> v, std::vector<uint32_t> i)
+    : BufferGeometry(bake(std::move(v), std::move(i)))
+{
+}
+BufferGeometry::BufferGeometry(Baked&& baked)
+    : vertices(std::move(baked.vertices)), indices(std::move(baked.indices)), minimum(baked.minimum),
+      maximum(baked.maximum)
+{
 }
 Geometry TriangleMeshGeometry(std::vector<Vertex> v, std::vector<uint32_t> i)
 {

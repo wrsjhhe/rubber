@@ -20,12 +20,19 @@ class BufferGeometry
 {
   public:
     BufferGeometry(std::vector<Vertex> vertices, std::vector<uint32_t> indices);
-    // 顶点与索引发布后不可变，改变几何只能创建新对象；旧快照因此始终能看到
-    // 当初提交的内容，缓存切换代际后也能按同一份 CPU 数据重新上传。
+    // 顶点、索引与包围盒都在构造时一次算定，之后全部只读：改变几何只能创建新
+    // 对象。旧快照因此始终使用发布时的剔除与阴影范围，缓存切换代际后也能按同
+    // 一份 CPU 数据重新上传。
     const std::vector<Vertex> vertices;
     const std::vector<uint32_t> indices;
     const AssetId id = nextAssetId();
-    glm::vec3 minimum{}, maximum{};
+    const glm::vec3 minimum, maximum;
+
+  private:
+    // 校验内容与包围盒在一次构造里算定，const 成员才能在初始化列表中固定下来。
+    struct Baked;
+    explicit BufferGeometry(Baked&&);
+    static Baked bake(std::vector<Vertex>, std::vector<uint32_t>);
 };
 using Geometry = std::shared_ptr<const BufferGeometry>;
 Geometry BoxGeometry(float width = 1, float height = 1, float depth = 1);

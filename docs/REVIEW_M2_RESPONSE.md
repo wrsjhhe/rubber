@@ -1,6 +1,19 @@
 # M2 审核回应
 
-回应日期：2026-11-20。被审版本 dev / bdfab25；修复版本为 dev 分支"M2 修复：固定资产版本与资产身份"提交。当前状态：待复审。
+回应日期：2026-11-20。被审版本 dev / bdfab25；修复版本为 dev 分支"M2 修复：固定资产版本与资产身份"提交。复审后追加"R-M2-001 补充"的修复，状态：待二次复审。
+
+## 复审追加：R-M2-001 补充 / 几何包围盒（已封闭）
+
+复审指出顶点与像素为 const 并未封闭整个渲染资产：`minimum/maximum` 仍是公开可变成员，调用方可保留 `shared_ptr<BufferGeometry>` 并改边界，`RenderScene::matches` 会按新边界重建，旧快照的 CPU 剔除与阴影范围随之漂移。
+
+修复：包围盒不再是可写字段，而是与顶点一起在构造时算定的 const 成员。构造改为校验与算边界一次完成（`BufferGeometry::Baked` + 私有构造），公开构造函数只做转交，因此不存在先构造再赋值的窗口。`BufferGeometry` 的五个渲染输入（`vertices`、`indices`、`minimum`、`maximum`、`id`）现在全部只读。
+
+验证：
+- 编译期：`tests/asset_check.cpp` 对几何与贴图的每个渲染输入加 `static_assert`，断言成员类型为 const。缺陷注入核对——把 `minimum/maximum` 改回可变后，`asset_check` 立即以 `static_assert failed: 'Bounds are mutable'` 编译失败（C2338），确认该检查不是空转；随后已还原。
+- 运行期：`BoxGeometry(2,4,2)` 的边界断言为 `(-1,-2,-1)..(1,2,1)`；把该网格上移 1.8 米使只有一部分落在视锥内，连续三次重放同一快照都画出中心深度 4.0，说明剔除与阴影范围使用的是发布时的边界。
+- 回归：`ctest` 4/4、四项 `--validation`、`gallery --smoke --validation` 通过；`gallery --capture` 仍与 `example/preview/courtyard.png` 字节一致（`356ab30b…`），`temporal_check` 误差数值不变。
+
+复审同时确认 R-M2-002 / 003 / 004 的修复通过复核，本轮未再改动这三处。
 
 四项阻塞问题的根因是同一个：资产"版本"由可变的 `revision` 字段和裸地址表达。修复把这个模型换掉，而不是逐条打补丁：
 
