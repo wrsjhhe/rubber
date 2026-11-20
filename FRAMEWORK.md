@@ -10,6 +10,6 @@
 | [实现进度](docs/PROGRESS.md) | 当前证据、M1—M6 任务、缺项和审核状态 |
 | [开发交接与审核](docs/CONTRIBUTING.md) | 实现、验证、更新进度及独立审核流程 |
 
-M3（帧图与六类独立 pass，资源声明与分配分离）已实现，现待审核：`src/render/graph/` 负责声明、裁剪、依赖与屏障推导，`src/render/passes/` 是只录制绘制的独立 pass，`activePasses()` 暴露按需执行清单。前序 M2（共享 RenderScene、不可变资产版本与上传依赖）已通过审核。交接记录与缺项见 [实现进度](docs/PROGRESS.md)，审核流程见 [开发交接与审核](docs/CONTRIBUTING.md)。审核通过后下一项为 M4：网格模块迁移、协议与点云。开发者按验收实现并更新至待审核；审核者针对确切版本独立核验，再决定是否已验收。
+M4（网格模块迁移、模块协议与点云）已实现，现待审核：`src/render/Module.hpp` 定义模块协议，`src/modules/mesh`、`src/modules/points` 是并列注册的两个模块，主调度只遍历接口、不含类型分支；点云用实例化公告板写同一张深度与 G-buffer，因此与网格双向遮挡。前序 M3（帧图与六类独立 pass、资源声明与分配分离）已通过审核（715233d），M2 亦已验收。交接记录与缺项见 [实现进度](docs/PROGRESS.md)，审核流程见 [开发交接与审核](docs/CONTRIBUTING.md)。审核通过后下一项为 M5：Observation、处理链入口、呈现隔离与互操作边界。开发者按验收实现并更新至待审核；审核者针对确切版本独立核验，再决定是否已验收。
 
 构建与运行见 [README](README.md)。旧实现背景见 [原架构说明](ARCHITECTURE.md)，框架目标以 docs/ARCHITECTURE.md 为准。不要在入口重复维护进度。

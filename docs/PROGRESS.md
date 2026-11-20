@@ -1,5 +1,17 @@
 # 实现进度
 
+## 最新状态（2026-11-20 / M4，待审核）
+
+**M4 已实现，待审核。** 网格与点云拆成两个并列模块（`src/modules/mesh`、`src/modules/points`），协议在 `src/render/Module.hpp`：`RenderModule` 负责跨相机共享的准备、缓存与上传依赖，`ModuleView` 只保存与相机有关的状态并声明自己的 pass，`FrameLifetime` 保活本帧共享数据。主调度只遍历接口，没有网格/点云类型分支。点云以位置、线性颜色、强度与半径（世界单位）加入场景，准备阶段一次变换到世界空间并合成一份共享存储缓冲；绘制用实例化公告板（6 顶点/点），半径按 `focal / 分辨率 / 视深` 换算成像素，因此同一份数据在不同分辨率与距离下保持物理尺寸，强度直接缩放辐亮度。点云 pass 对硬件深度做 `LESS_OR_EQUAL` 测试并回写，同时写 HDR、五个 G-buffer、米制深度与实例标签，于是点与网格双向遮挡，且颜色与几何真值属于同一物体。
+
+本轮验证：Release 构建通过；七项 CTest 全通过（新增 `points_check`）；六项 `--validation` 各 0 条校验错误；`gallery --capture m4-capture.png --validation` 退出 0、0 条，与 `example/preview/courtyard.png` 差异仍为 37472/4096000 字节（0.915%）、`max_delta=1`；`temporal_check` 静止 raw=28.623 / TAA=6.28194、运动轮廓 347.217/293.813 逐位不变。
+
+本轮同时修掉两个只在点云路径上暴露的缺陷：`beginPass()` 的颜色附件描述数组原来按 5 个静态分配，而颜色链路的点云 pass 需要六个（五个 G-buffer 加 HDR），越界写栈并触发 `0xC0000409`；顶点着色器又用 `frame.vp[1][1]` 换算像素半径，而 Vulkan 的 y 向下裁剪空间让该分量为负（实测 −2.246），半径被钳到最小 0.5 像素、点云退化成单像素。前者改为按 `maxColorAttachments` 分配并在超限时抛错，后者取绝对值；`points_check` 的半径覆盖与分辨率比例断言覆盖第二条。
+
+## 最新独立验收（2026-11-20 / 715233d）
+
+**M3 已验收，可进入 M4。** 声明期与执行期缓冲区间表已隔离，R-M3-001 补充关闭，M3 三项审核问题全部关闭。独立 Release、六项 CTest、五项 --validation 和 Gallery smoke 通过；TAA 数值不变。详见 [最终复审](REVIEW_M3.md)。本节取代下方历史待审核/需修改状态。性能优化、区间合并优化、多队列与显存别名不在本次验收范围。
+
 ## 最新状态（2026-11-20 / M3 复审补充修复 715233d）
 
 **R-M3-001 补充项已修复，待复审。** 根因是执行期重放复用了声明期为压缩依赖而合并的缓冲段：`plan()` 把 `defined`/`stage`/`access`/`lastWrite` 写到整段上，一次局部写入就把未访问字节标成已定义。修复把两者彻底分开——声明期 `segments` 只服务裁剪与排序；执行期在 `plan()` 内新建一张覆盖 `[0,size)` 的区间表，初始状态完全由导入声明推导，并按所有活跃访问的 `pieces` 边界预切分，于是每次访问恰好等于若干整段，状态更新精确到被访问的字节；导出收尾也改读这张表。`graph_check` 新增两条用例（局部写 + 读另一半 + 整体覆写必须报未初始化；完整写后分段以不同访问读、再整体覆写时每段屏障源状态各自正确），并用 083f8fe 的真实实现验证两条都会失败。Release 构建、六项 CTest、五项 `--validation`、Gallery 捕获差异（0.915%，`max_delta=1`）、`temporal_check` 数值均与首轮修复逐位一致。详见 [M3 审核回应](REVIEW_M3_RESPONSE.md)。
@@ -52,7 +64,7 @@ Release、四项 CTest、asset_check --validation、Gallery smoke 独立通过�
 | F05 几何路径 | 已有实现，待审核；submit/renderFrame | 跳过光照/TAA，新 View 不建颜色历史；仍写五个 G-buffer，用过颜色的 View 保留颜色资源 |
 | F02 缓存拆分 | 已验收（278371f）；render/RenderScene.hpp、render/RenderScene.cpp、assets/AssetCache.hpp、backend/Device.hpp、tests/asset_check.cpp | 场景准备仍在调用线程录制；实例缓冲按快照版本重新分配，未跨版本复用；上传批未限流 |
 | F07 帧图 | 已有实现，待审核；render/graph/FrameGraph.hpp、FrameGraph.cpp、tests/graph_check.cpp | 单队列顺序执行；保守屏障（每 pass 保守 stage/access，不做合并优化）；瞬时资源按描述缓存复用，未做显存别名 |
-| F08 | 待开发 | 无 mesh/points 模块协议，几何通道仍是单一 opaques 列表 |
+| F08 模块与点云 | 已有实现，待审核；render/Module.hpp、modules/mesh、modules/points、shaders/points.vert、shaders/points.frag、render/passes/PointsPass.cpp、tests/points_check.cpp | 点云不在 CPU 侧剔除，也不参与阴影投射；无逐点历史，运动向量写零（时序解析不复用旧像素）；点云仍需按节点逐点展开到一份共享缓冲，总量受 `maxStorageBufferRange` 限制；gallery 示例场景尚未加入点云 |
 | F09 | 部分实现 | 已有内参、时间、真值输出和互操作头；无独立 Observation/sensors/presentation |
 | F10 | 待开发 | 无 install/export/find_package 验证 |
 | F11—F17 | 未实现 | 后续规划，不列为已支持 |
@@ -65,14 +77,16 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 |---|---|---|---|
 | M1 | 已有实现，待审核 | F05/F06 请求、结果、槽位、互操作 | 双相机、旧结果不变、Busy/恢复、销毁 View/Renderer 后读取、非法请求及 GPU 寿命 |
 | M2 | M1；已验收（278371f） | RenderScene、共享静态实例数据、不可变资产版本、上传依赖、延迟回收 | asset_check：同快照两相机准备与上传各一次、旧快照在原对象被修改后与清缓存后仍重现原画面、身份不复用、静止收敛后换贴图的 Color 更新、上传批与暂存回落、旧代际最终回收、渲染输入只读的编译期断言 |
-| M3 | M2；已有实现，待复审 | 帧图及六类独立 pass，资源声明与分配分离 | graph_check：裁剪、未初始化读取（图像与缓冲逐区间，含"局部写+整体覆写"合并路径）、同 pass 读写冲突、循环依赖、子资源精确展开、缓冲分段导出与生产者、跨子资源/跨区间 RAW/WAR/WAW、分段读后覆写的每段屏障源状态、usage 诊断、导出终态；pass_check：按输出通道断言活跃 pass 清单（含首帧历史清除与状态变化后的重建）；六项 CTest 与五项 --validation |
-| M4 | M3；待开发 | 网格模块迁移、协议和点云 | 双相机下点/网格前后遮挡；主调度无点云分支；强度/半径保留；深度/ID 语义明确 |
+| M3 | M2；已验收（715233d） | 帧图及六类独立 pass，资源声明与分配分离 | graph_check：裁剪、未初始化读取（图像与缓冲逐区间，含"局部写+整体覆写"合并路径）、同 pass 读写冲突、循环依赖、子资源精确展开、缓冲分段导出与生产者、跨子资源/跨区间 RAW/WAR/WAW、分段读后覆写的每段屏障源状态、usage 诊断、导出终态；pass_check：按输出通道断言活跃 pass 清单（含首帧历史清除与状态变化后的重建）；六项 CTest 与五项 --validation |
+| M4 | M3；已有实现，待审核 | 网格模块迁移、模块协议、点云 | points_check：同一快照两台相机下点在前/网格在前的遮挡互换、米制深度与实例标签取值、仅点云场景、点云 pass 相对网格 pass 的插入位置、强度→亮度与半径→覆盖互不影响、覆盖面积随分辨率平方增长；七项 CTest 与六项 --validation |
 | M5 | M4；待开发 | Observation、处理链入口、呈现隔离、互操作边界 | Beauty+调试同帧不串色；校准/时间一致；真值独立；无需实现全部 F11—F13 即可验收框架 |
 | M6 | M5；待开发 | 安装头文件/库/shader、导出 target/依赖 | 新安装前缀的外部项目 find_package 构建并离屏运行，不访问原源码/构建目录；关闭 example 可构建 |
 
 每项保留现有回归。F11—F17 分别立项，先补规格和质量/性能门槛。
 
 ## 已有验证与缺口
+
+本轮（M4）：Release 构建成功；sensor_check、temporal_check、request_check、asset_check、pass_check、points_check、graph_check 七项 CTest 全通过；sensor/temporal/request/asset/pass/points 六项分别以 `--validation` 运行，均 0 条校验错误；`gallery --capture m4-capture.png --validation` 退出 0、0 条；捕获图与 example/preview/courtyard.png 差异仍为 37472/4096000 字节（0.915%），`max_delta=1`；temporal_check 数值与 M3 逐位相同。点云路径此前完全无测试覆盖，本轮首次执行该路径即暴露 `beginPass()` 附件数组越界与负号半径两处缺陷，已修复并由 points_check 的覆盖面积断言守住。
 
 本轮（M3 修复）：Release 构建成功；六项 CTest 全通过；sensor/temporal/request/asset/pass 五项 `--validation` 均 0 条校验错误；gallery `--capture --validation` 退出 0、0 条；捕获图与 example/preview/courtyard.png 差异仍为 37472/4096000 字节（0.915%），`max_delta=1`、`mean_delta=1`；temporal_check 数值与修复前逐位相同。graph_check 新增 10 个用例，并用旧版源码与四处缺陷注入分别确认它们会失败。
 
@@ -84,9 +98,46 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 
 缺陷注入核对：把 TAA 历史比较临时放宽为只比几何与变换（去掉材质与贴图身份）后，asset_check 在"Texture swap kept frozen TAA history"处失败；把几何包围盒改回可变成员后，asset_check 以 `static_assert failed: 'Bounds are mutable'`（C2338）编译失败。两处用例因此确认有效，均已还原。
 
-尚缺显存分配自动统计证据、多队列/异步计算路径、显存别名复用，以及点云/安装测试。活跃 pass 清单已由 pass_check 按输出通道逐项断言，但只覆盖本仓库现存的通道组合，未覆盖全部请求×交付×选项组合。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。
+尚缺显存分配自动统计证据、多队列/异步计算路径、显存别名复用，以及安装测试。点云已由 points_check 覆盖单点数据、双相机遮挡、仅点云场景、两种分辨率与强度/半径语义，尚未覆盖大规模点云、逐点运动与阴影投射。活跃 pass 清单已由 pass_check 按输出通道逐项断言，但只覆盖本仓库现存的通道组合，未覆盖全部请求×交付×选项组合。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。
 
 ## 交接记录
+
+### M4 / F08 模块协议与点云
+
+任务编号 / 功能编号：M4 / F08，并落实 F07 的读改写声明
+负责人 / 日期 / 状态：开发者 / 2026-11-20 / 待审核
+代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支 M4 提交「M4：模块协议、网格模块迁移与点云模块」
+修改文件 / 接口变化：
+- `src/render/Module.hpp`（新增）：`FrameImage`/`FrameBuffer`/`FrameStats`/`FrameResources`/`FrameLifetime`/`ModuleViewDesc`/`ModuleView`/`AssetProvider`/`RenderModule`。模块只拿帧级共享资源与自己的视图状态，不接触 `Renderer::Impl` 私有字段
+- `src/render/GraphBridge.hpp`（新增）：声明层语义到 Vulkan 格式/usage/布局的换算，从 `Renderer.cpp` 抽出
+- `src/modules/mesh/MeshModule.{hpp,cpp}`（新增）：网格模块。按 `sceneKey(快照, 资产代际)` 与内容哈希复用 `RenderScene`，视图侧持有阴影图、上一帧姿态缓冲与光照描述符集合，声明 `shadow`/`geometry`/`lighting`/`geometry.stable`
+- `src/modules/points/RenderPoints.{hpp,cpp}`、`src/modules/points/PointsModule.{hpp,cpp}`（新增）：共享点云缓冲（世界空间 `positionRadius`/`colorIntensity`/`label`，一次 `UploadBatch` 上传）与点云视图，声明 `points`/`points.stable`
+- `include/sim/Scene.hpp`、`src/scene/Scene.cpp`：`PointVertex`、不可变 `BufferPointCloud`（构造时算定包围盒与最大半径，包围盒按最大半径外扩）、`PointObject`、`SceneSnapshot::points`、`Scene::addPoints`
+- `src/render/graph/FrameGraph.{hpp,cpp}`：新增 `readWrite(ImageHandle, Access, Subresource)` 声明；`Use::readsBack` 使读改写既激活写者又要求先前内容已定义
+- `shaders/points.vert`、`shaders/points.frag`（新增，片元编译 `POINTS_HDR=1/0` 两个变体）、`src/render/passes/PointsPass.cpp`（新增）、`src/render/Pipeline.{hpp,cpp}`（`GraphicsOptions`、`splat`/`splatDepth` 管线、`maxColorAttachments`、`beginPass(..., bool load)`）
+- `src/backend/Device.cpp`：要求 `shaderDemoteToHelperInvocation`、`independentBlend` 与 `maxColorAttachments >= 6`
+- `src/render/Renderer.cpp`、`include/sim/Renderer.hpp`：主调度改为遍历 `modules`；`FrameLifetime` 取代 `RenderScene` 作为 `FrameResult` 的保活凭据；新增 `View::visiblePoints()`
+- `tests/points_check.cpp`（新增）、`CMakeLists.txt`：注册第七项 CTest 与点云片元变体
+已完成：
+- 主调度无点云分支：`Renderer::renderFrame` 只按接口调用 `prepare`/`declare`/`declareLate`/`unchanged`，网格与点云是同一条路径上的两个模块
+- 点与网格共用一张硬件深度：点云 pass 走 `beginPass(..., load=true)` 保留网格结果，深度 `LESS_OR_EQUAL` 且回写，网格在前时挡住点、点在前时覆盖网格
+- 强度与半径保留：半径以世界单位进入缓冲，着色器按 `abs(focal) * 0.5 / 视深 * 分辨率` 换算像素并取最小值 0.5 像素，强度乘到线性颜色上作为辐亮度按覆盖度预乘混合
+- 深度/ID 语义：点写入 `MetricDepth`（`1/gl_FragCoord.w`，与网格同一公式）与 `InstanceId`（最高位置 1、低 31 位为点云节点 ID），`Motion` 写零表示无历史匹配，`AlbedoMetal`/`NormalRough` 与网格同义
+仍缺项：
+- 点云不做 CPU 剔除、不投射阴影；无逐点运动向量，移动的点云不会生成正确速度，只保证不被 TAA 复用旧像素
+- 每个节点把整份点云逐点展开到共享缓冲，总量受 `maxStorageBufferRange` 限制，未做分批绘制
+- gallery 示例场景未加入点云，视觉回归仍只覆盖网格路径
+- 沿用上一轮：单队列顺序执行、屏障保守、瞬时资源无显存别名
+环境 / 精确构建测试命令：Windows、Visual Studio 2022 x64、Vulkan SDK 1.4.357.0、RTX 3080 Ti
+- `cmake --build build-dev --config Release`
+- `ctest --test-dir build-dev -C Release --output-on-failure`
+- `sensor_check|temporal_check|request_check|asset_check|pass_check|points_check --validation`
+- `gallery --capture build-dev/m4-capture.png --validation`；`python tools/pngdiff.py …`
+结果 / 日志截图位置：七项 CTest 全通过；六项 `--validation` 与 gallery 均 0 条校验错误；捕获图与参考图差异 37472/4096000（0.915%），`max_delta=1`；`temporal_check` raw=28.623、TAA=6.28194、移动 347.217/293.813 逐位不变
+缺陷注入核对：`points_check` 首次运行时点云路径直接以 `0xC0000409` 崩溃——`beginPass()` 的 `std::array<VkRenderingAttachmentInfo, 5>` 被六个附件写出栈；修好后用例在"Point in front did not own the pixel"失败，进一步把顶点着色器的像素半径以深度通道输出，读到 `pixels=0.5`（钳位值）与 `vp[1][1]=-2.246`，确认半径被算成负数。两处修复后用例通过；把任一处改回（数组改回 5、去掉 `abs`）都会重新失败，故该用例对这两条缺陷有效
+性能和画质对比：未做性能测量；网格路径画面与数值与 M3 逐位一致，点云只影响含点云的场景
+已知问题 / 下一步：等待复审；通过后进入 M5（Observation、处理链入口、呈现隔离、互操作边界）
+审核人 / 审核版本 / 结论 / 问题编号：待填
 
 ### M3 复审补充修复 / F07（回应 R-M3-001 补充）
 
