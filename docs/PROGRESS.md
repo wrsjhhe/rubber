@@ -1,6 +1,6 @@
 # 实现进度
 
-## 最新状态（2026-11-20 / dev M3 提交）
+## 最新状态（2026-11-20 / 996a779）
 
 **M3 已实现，待审核。** 帧图（`src/render/graph/`）把资源声明与 Vulkan 分配/布局彻底分开：pass 只声明"读/写哪个资源的哪个子资源，用哪类访问"，编译期完成反向裁剪、拓扑排序、RAW/WAR/WAW 依赖推导和屏障生成，执行期才翻译成 `vkCmdPipelineBarrier`。渲染拆成历史清除、阴影、几何、光照、时序解析、颜色变换、读回七类可独立裁剪的 pass，`shaders/resolve.frag` 拆为 `temporal.frag` + `color.frag`。
 
@@ -74,7 +74,7 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 
 任务编号 / 功能编号：M3 / F07（帧图），关联 F03/F04
 负责人 / 日期 / 状态：开发者 / 2026-11-20 / 待审核
-代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支"M3：帧图与六类独立 pass"提交
+代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支 996a779「M3：帧图与六类独立 pass（资源声明与分配分离）」
 修改文件 / 接口变化：
 - 新增 `src/render/graph/FrameGraph.hpp`、`src/render/graph/FrameGraph.cpp`：声明层枚举 `Format/Aspect/Layout/Access/ImageUsage/BufferUsage`、`ImageHandle/BufferHandle/PassHandle`、`Subresource{mip,mipCount,layer,layerCount}`、`BufferRange{offset,size}`、`Barrier`、`CompiledPass`、`Transient`；`Declaration::read/write`（图像与缓冲各自重载）、`after()`、`sideEffect()`；`importImage/importBuffer`（声明初始布局与是否已初始化）、`createImage/createBuffer`（瞬时）、`exportImage/exportBuffer`（裁剪根，声明终态布局）、`restoreImage`（非裁剪根，仅回写布局）、`reserve/addPass/bind/compile/execute/reset`；观察接口 `activePasses()/passes()/finalBarriers()/transients()/barrierCount()/names()`
 - 新增 `src/render/FrameData.hpp`：从 Renderer.cpp 抽出的 `Globals`（1072 字节，`static_assert` 锁布局）、`Draw`、`temporalSamples`、`halton`、`sameLights`、`corners`、`sceneKey`、`fitShadows`
