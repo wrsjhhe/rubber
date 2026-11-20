@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sim::vk
@@ -233,7 +234,14 @@ class FrameGraph
         int32_t writer = -1; // 声明期的最近写入者，-1 表示没有（导入内容或未定义）
         bool defined = false;
         bool lastWrite = false;
+        bool used = false;            // 本帧被活跃 pass 访问过；导出/恢复只处理这类子资源
         std::vector<uint32_t> readers; // 自上次写入以来的读取者，用于 WAR
+    };
+    // 缓冲的一段字节区间及其状态；段边界与声明过的范围对齐，段之间不重叠。
+    struct Segment
+    {
+        uint64_t begin = 0, end = 0;
+        Cell state;
     };
     struct Use
     {
@@ -243,8 +251,11 @@ class FrameGraph
         BufferRange range;
         bool write = false;
         Access access = Access::Sampled;
-        std::vector<int32_t> writers;      // 声明期各 cell 的写入者快照
-        std::vector<uint32_t> readers;     // 写入前该 cell 的读取者快照，用于 WAR
+        // 本次访问的精确子资源：图像为 cell 下标，缓冲为字节区间。声明期算定，plan 直接复用。
+        std::vector<uint32_t> cells;
+        std::vector<std::pair<uint64_t, uint64_t>> pieces;
+        std::vector<int32_t> writers;  // 相交子资源上声明期的全部写入者（去重）
+        std::vector<uint32_t> readers; // 写入前相交子资源上的全部读取者（去重），用于 WAR
     };
     struct PassNode
     {
@@ -278,12 +289,18 @@ class FrameGraph
         bool initialized = false;
         bool exported = false;
         vk::Buffer* physical = nullptr;
-        // 首版按整个缓冲跟踪状态，写入范围取并集，导出屏障覆盖真实写过的字节。
-        BufferRange written;
-        Cell state;
+        // 缓冲按字节区间切段跟踪：每段有自己的写入者、读者与"是否已定义"。
+        // 只覆盖声明过的区间，未声明过的字节按导入声明推导默认状态。
+        std::vector<Segment> segments;
     };
 
-    std::pair<uint32_t, uint32_t> cellRange(const ImageResource&, const Subresource&) const;
+    // 图像子资源的精确下标集（layer × mip 双重展开，不做首末压平）。
+    std::vector<uint32_t> cellsOf(const ImageResource&, const Subresource&) const;
+    // 把 [begin,end) 对齐成段边界，缺失部分按默认状态补齐，返回恰好覆盖该区间的字节区间。
+    std::vector<std::pair<uint64_t, uint64_t>> segmentsOf(BufferResource&, uint64_t begin, uint64_t end);
+    Segment* findSegment(BufferResource&, uint64_t begin, uint64_t end);
+    void mergeSegments(BufferResource&);
+
     Use& addUse(Declaration&, bool image, uint32_t resource, const Subresource&, const BufferRange&, bool write,
                 Access);
     void validate(const PassNode&, const Use&) const;

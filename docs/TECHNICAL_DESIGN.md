@@ -45,7 +45,7 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 
 从请求输出、必要历史写回和副作用反向裁剪；不能误裁 GPU 输出。编译执行顺序、屏障及首末使用点。首版单队列、保守分配，别名复用和多队列后续优化。仅包装固定调用不能算完成帧图。
 
-当前实现：`src/render/graph/FrameGraph.hpp` 的声明层用 `Layout`/`Access`/`ImageUsage`/`BufferUsage` 描述意图，pass 体内不出现 `VkImageLayout`/`VkAccessFlags`；`Subresource{mip,mipCount,layer,layerCount}` 与 `BufferRange{offset,size}` 让依赖按子资源求交。`compile()` 依次做校验、反向裁剪（`exportImage/exportBuffer` 与 `sideEffect` 为根）、拓扑排序（RAW/WAW 串写者，WAR 用读取者快照建边并阻止调度器前移）、屏障规划；`execute()` 才翻译成 `vkCmdPipelineBarrier` 并回写物理布局。导入声明初始布局与是否已初始化，导出声明终态布局并作为裁剪根，`restoreImage` 只回写布局、不作根，供跨帧复用的历史槽使用。`Renderer.cpp` 每帧重建声明，再按 `transients()` 分配或复用瞬时资源；槽奇偶与历史有效性只随真正写入历史的帧推进，几何真值与 GPU 交付请求不再使 TAA 历史失效。有效 pass 清单经 `View::activePasses()` 对外可见，`tests/pass_check.cpp` 按输出通道逐项断言，`tests/graph_check.cpp` 在无设备条件下覆盖裁剪与诊断。
+当前实现：`src/render/graph/FrameGraph.hpp` 的声明层用 `Layout`/`Access`/`ImageUsage`/`BufferUsage` 描述意图，pass 体内不出现 `VkImageLayout`/`VkAccessFlags`；`Subresource{mip,mipCount,layer,layerCount}` 与 `BufferRange{offset,size}` 让依赖按子资源求交。跟踪粒度是逐区间的：图像按 (mip, layer) 展开成精确 cell 集（多 layer 的子范围不做首末压平），缓冲按字节段切分并只覆盖声明过的区间，每段各自记录写入者、读取者与是否已定义，因此"写了一部分就读全部"会在编译期被拒绝。一次写入会收集所有相交子资源的旧写入者与读取者，建立完整 WAW/WAR 边。`compile()` 依次做校验、反向裁剪（`exportImage/exportBuffer` 与 `sideEffect` 为根）、拓扑排序、屏障规划；`execute()` 才翻译成 `vkCmdPipelineBarrier` 并回写物理布局。导入声明初始布局与是否已初始化，导出声明终态布局并作为裁剪根，`restoreImage` 只回写布局、不作根，供跨帧复用的历史槽使用；导出与恢复只转换本帧被访问过的子资源，整图消费者需自行声明整图范围。`Renderer.cpp` 每帧重建声明，再按 `transients()` 分配或复用瞬时资源；槽奇偶与历史有效性只随真正写入历史的帧推进，几何真值与 GPU 交付请求不再使 TAA 历史失效。有效 pass 清单经 `View::activePasses()` 对外可见，`tests/pass_check.cpp` 按输出通道逐项断言，`tests/graph_check.cpp` 在无设备条件下覆盖裁剪、诊断与区间跟踪。
 
 模块负责资产准备、类型批次、可见性、资源/pass 注册、输出语义和历史失效。点云有自己的数据和绘制实现，公共调度只调用协议。
 

@@ -134,6 +134,30 @@ std::string subresourceText(const Subresource& s)
     return "mip " + std::to_string(s.mip) + "+" + std::to_string(s.mipCount) + " layer " +
            std::to_string(s.layer) + "+" + std::to_string(s.layerCount);
 }
+// 依赖快照按"相交子资源的全集"记录：同一个 pass 跨多个 mip/layer 或字节区间时去重合并，
+// 不能只保留第一个写入者或最后一个 cell 的读者。
+void appendUnique(std::vector<int32_t>& list, int32_t value)
+{
+    if (value < 0)
+        return;
+    if (std::find(list.begin(), list.end(), value) == list.end())
+        list.push_back(value);
+}
+void appendUnique(std::vector<uint32_t>& list, uint32_t value)
+{
+    if (std::find(list.begin(), list.end(), value) == list.end())
+        list.push_back(value);
+}
+void appendUnique(std::vector<int32_t>& list, const std::vector<uint32_t>& values)
+{
+    for (auto value : values)
+        appendUnique(list, int32_t(value));
+}
+void appendUnique(std::vector<uint32_t>& list, const std::vector<uint32_t>& values)
+{
+    for (auto value : values)
+        appendUnique(list, value);
+}
 }
 void FrameGraph::Declaration::read(ImageHandle handle, Access access, Subresource sub)
 {
@@ -169,7 +193,7 @@ void FrameGraph::Declaration::sideEffect()
 {
     graph->nodes[pass].sideEffect = true;
 }
-std::pair<uint32_t, uint32_t> FrameGraph::cellRange(const ImageResource& image, const Subresource& sub) const
+std::vector<uint32_t> FrameGraph::cellsOf(const ImageResource& image, const Subresource& sub) const
 {
     auto& desc = image.desc;
     uint32_t mips = sub.mipCount ? sub.mipCount : desc.mipLevels - std::min(sub.mip, desc.mipLevels);
@@ -177,9 +201,99 @@ std::pair<uint32_t, uint32_t> FrameGraph::cellRange(const ImageResource& image, 
     if (!mips || !layers || sub.mip + mips > desc.mipLevels || sub.layer + layers > desc.layers)
         throw std::logic_error("Frame graph subresource out of range on " + image.name + ": " +
                                subresourceText(sub));
-    auto first = sub.layer * desc.mipLevels + sub.mip;
-    auto last = (sub.layer + layers - 1) * desc.mipLevels + sub.mip + mips - 1;
-    return {first, last};
+    // layer × mip 双重展开：多 layer 的子范围不是一段连续的 cell 区间，压平会把无关子资源算进来。
+    std::vector<uint32_t> cells;
+    cells.reserve(size_t(mips) * layers);
+    for (uint32_t layer = sub.layer; layer < sub.layer + layers; ++layer)
+        for (uint32_t mip = sub.mip; mip < sub.mip + mips; ++mip)
+            cells.push_back(layer * desc.mipLevels + mip);
+    return cells;
+}
+FrameGraph::Segment* FrameGraph::findSegment(BufferResource& buffer, uint64_t begin, uint64_t end)
+{
+    for (auto& segment : buffer.segments)
+        if (segment.begin == begin && segment.end == end)
+            return &segment;
+    return nullptr;
+}
+std::vector<std::pair<uint64_t, uint64_t>> FrameGraph::segmentsOf(BufferResource& buffer, uint64_t begin,
+                                                                  uint64_t end)
+{
+    if (begin >= end)
+        return {};
+    // 未声明过的字节按导入声明推导：没有写入者，是否已定义取决于导入时是否初始化。
+    auto untouched = [&buffer]
+    {
+        Cell state;
+        state.layout = Layout::Undefined;
+        state.stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        state.access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+        state.writer = -1;
+        state.defined = buffer.initialized;
+        state.lastWrite = buffer.initialized;
+        return state;
+    };
+    auto sort = [&buffer]
+    { std::sort(buffer.segments.begin(), buffer.segments.end(), [](auto& a, auto& b) { return a.begin < b.begin; }); };
+    // 先让段边界与本次访问对齐，之后的依赖与屏障都以段为单位。
+    auto splitAt = [&buffer](uint64_t point)
+    {
+        for (size_t i = 0; i < buffer.segments.size(); ++i)
+        {
+            auto segment = buffer.segments[i];
+            if (segment.begin < point && point < segment.end)
+            {
+                buffer.segments[i].end = point;
+                segment.begin = point;
+                buffer.segments.push_back(segment);
+            }
+        }
+    };
+    splitAt(begin);
+    splitAt(end);
+    sort();
+    // 补上区间内还没有段覆盖的空洞。
+    std::vector<Segment> filled;
+    auto cursor = begin;
+    for (auto& segment : buffer.segments)
+    {
+        if (segment.end <= begin || segment.begin >= end)
+            continue;
+        if (segment.begin > cursor)
+            filled.push_back({cursor, segment.begin, untouched()});
+        cursor = std::max(cursor, segment.end);
+    }
+    if (cursor < end)
+        filled.push_back({cursor, end, untouched()});
+    if (!filled.empty())
+    {
+        buffer.segments.insert(buffer.segments.end(), filled.begin(), filled.end());
+        sort();
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> pieces;
+    for (auto& segment : buffer.segments)
+        if (segment.begin >= begin && segment.end <= end)
+            pieces.push_back({segment.begin, segment.end});
+    return pieces;
+}
+void FrameGraph::mergeSegments(BufferResource& buffer)
+{
+    std::sort(buffer.segments.begin(), buffer.segments.end(),
+              [](const Segment& a, const Segment& b) { return a.begin < b.begin; });
+    auto same = [](const Cell& a, const Cell& b)
+    {
+        return a.layout == b.layout && a.stage == b.stage && a.access == b.access && a.writer == b.writer &&
+               a.defined == b.defined && a.lastWrite == b.lastWrite && a.readers == b.readers;
+    };
+    std::vector<Segment> merged;
+    for (auto& segment : buffer.segments)
+    {
+        if (!merged.empty() && merged.back().end == segment.begin && same(merged.back().state, segment.state))
+            merged.back().end = segment.end;
+        else
+            merged.push_back(segment);
+    }
+    buffer.segments = std::move(merged);
 }
 FrameGraph::Use& FrameGraph::addUse(Declaration& decl, bool image, uint32_t resource, const Subresource& sub,
                                     const BufferRange& range, bool write, Access access)
@@ -195,25 +309,27 @@ FrameGraph::Use& FrameGraph::addUse(Declaration& decl, bool image, uint32_t reso
     if (image)
     {
         auto& res = images[resource];
-        auto [first, last] = cellRange(res, sub);
-        for (auto i = first; i <= last; ++i)
+        use.cells = cellsOf(res, sub);
+        for (auto index : use.cells)
         {
-            auto& cell = res.cells[i];
-            use.writers.push_back(cell.writer);
+            auto& cell = res.cells[index];
             if (write)
             {
                 // 同一 pass 内的读后写会形成反馈回路，属于冲突声明。
                 if (std::find(cell.readers.begin(), cell.readers.end(), decl.pass) != cell.readers.end())
                     throw std::logic_error("Frame graph pass '" + node.name + "' reads and writes " + res.name +
                                            " in the same pass");
-                use.readers = cell.readers;
+                // 覆盖写要等所有这些读取者与上一个写入者完成：WAR 与 WAW 都按全部相交子资源建立。
+                appendUnique(use.writers, cell.writer);
+                appendUnique(use.readers, cell.readers);
                 cell.writer = int32_t(decl.pass);
                 cell.readers.clear();
                 cell.defined = true;
             }
             else
             {
-                cell.readers.push_back(decl.pass);
+                appendUnique(use.writers, cell.writer);
+                appendUnique(cell.readers, decl.pass);
             }
         }
     }
@@ -224,28 +340,32 @@ FrameGraph::Use& FrameGraph::addUse(Declaration& decl, bool image, uint32_t reso
         auto start = range.offset, end = range.size ? range.offset + range.size : size;
         if (end > size || start > end)
             throw std::logic_error("Frame graph buffer range out of bounds on " + res.name);
-        use.writers.push_back(res.state.writer);
-        if (write)
+        // 缓冲按区间切段：只跟踪被声明过的字节，空洞不会因为"取最小到最大的并集"而被算作已写。
+        use.pieces = segmentsOf(res, start, end);
+        for (auto& piece : use.pieces)
         {
-            if (std::find(res.state.readers.begin(), res.state.readers.end(), decl.pass) !=
-                res.state.readers.end())
-                throw std::logic_error("Frame graph pass '" + node.name + "' reads and writes " + res.name +
-                                       " in the same pass");
-            use.readers = res.state.readers;
-            res.state.writer = int32_t(decl.pass);
-            res.state.readers.clear();
-            res.state.defined = true;
-            if (!res.written.size)
-                res.written = {start, end - start};
+            auto* segment = findSegment(res, piece.first, piece.second);
+            if (!segment)
+                throw std::logic_error("Frame graph lost the tracked range of " + res.name);
+            if (write)
+            {
+                if (std::find(segment->state.readers.begin(), segment->state.readers.end(), decl.pass) !=
+                    segment->state.readers.end())
+                    throw std::logic_error("Frame graph pass '" + node.name + "' reads and writes " + res.name +
+                                           " in the same pass");
+                appendUnique(use.writers, segment->state.writer);
+                appendUnique(use.readers, segment->state.readers);
+                segment->state.writer = int32_t(decl.pass);
+                segment->state.readers.clear();
+                segment->state.defined = true;
+            }
             else
             {
-                auto begin = std::min(res.written.offset, start);
-                auto finish = std::max(res.written.offset + res.written.size, end);
-                res.written = {begin, finish - begin};
+                appendUnique(use.writers, segment->state.writer);
+                appendUnique(segment->state.readers, decl.pass);
             }
         }
-        else
-            res.state.readers.push_back(decl.pass);
+        mergeSegments(res);
     }
     validate(node, use);
     node.uses.push_back(std::move(use));
@@ -305,11 +425,7 @@ BufferHandle FrameGraph::importBuffer(std::string name, const BufferDesc& desc, 
     res.desc = desc;
     res.imported = true;
     res.initialized = initialized;
-    res.state.layout = Layout::Undefined;
-    res.state.stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    res.state.access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-    res.state.defined = initialized;
-    res.state.lastWrite = initialized;
+    // 段按声明范围惰性建立：没被访问过的字节不需要状态。
     buffers.push_back(std::move(res));
     return {uint32_t(buffers.size() - 1)};
 }
@@ -404,13 +520,15 @@ std::vector<bool> FrameGraph::cull()
         stack.push_back(i);
     };
     // 根：导出的资源由导出点决定需要的生产者；GPU 交付的输出没有被误裁的可能。
+    // 缓冲按段激活：只激活整段导出所必需的区间生产者，任何区间都不能被漏掉。
     for (auto& image : images)
         if (image.exported)
             for (auto& cell : image.cells)
                 activate(cell.writer);
     for (auto& buffer : buffers)
         if (buffer.exported)
-            activate(buffer.state.writer);
+            for (auto& segment : buffer.segments)
+                activate(segment.state.writer);
     for (uint32_t i = 0; i < nodes.size(); ++i)
         if (nodes[i].added && nodes[i].sideEffect)
             activate(int32_t(i));
@@ -429,42 +547,35 @@ std::vector<uint32_t> FrameGraph::order(const std::vector<bool>& live)
 {
     std::vector<uint32_t> seq, pending(nodes.size(), 0);
     std::vector<std::vector<uint32_t>> edges(nodes.size());
+    auto addEdge = [&](uint32_t from, uint32_t to)
+    {
+        if (from == to)
+            return;
+        // 同一对 pass 可能由多个子资源产生同一条依赖，去重后再计数。
+        if (std::find(edges[from].begin(), edges[from].end(), to) != edges[from].end())
+            return;
+        edges[from].push_back(to);
+        ++pending[to];
+    };
     for (uint32_t i = 0; i < nodes.size(); ++i)
     {
         if (!live[i])
             continue;
         for (auto pred : nodes[i].after)
             if (pred < nodes.size() && live[pred])
-            {
-                edges[pred].push_back(i);
-                ++pending[i];
-            }
+                addEdge(pred, i);
         // 资源依赖：写入者先于读取者，前一写入者与读取者也约束本 pass。
+        // use.writers/readers 已按全部相交子资源去重合并，跨 mip/layer/字节区间的覆盖写不会漏边。
         for (auto& use : nodes[i].uses)
         {
+            for (auto writer : use.writers)
+                if (writer >= 0 && uint32_t(writer) < nodes.size() && live[size_t(writer)])
+                    addEdge(uint32_t(writer), i);
+            // WAR：本次写入之前已经读取该资源的 pass 必须先完成。
             if (use.write)
-            {
-                // WAW：前一个写入者必须先完成。
-                if (use.writers.front() >= 0 && live[size_t(use.writers.front())])
-                {
-                    edges[size_t(use.writers.front())].push_back(i);
-                    ++pending[i];
-                }
-                // WAR：本次写入之前已经读取该资源的 pass 必须先完成。
                 for (auto reader : use.readers)
-                    if (reader < nodes.size() && live[reader] && reader != i)
-                    {
-                        edges[reader].push_back(i);
-                        ++pending[i];
-                    }
-            }
-            else
-                for (auto writer : use.writers)
-                    if (writer >= 0 && live[size_t(writer)])
-                    {
-                        edges[size_t(writer)].push_back(i);
-                        ++pending[i];
-                    }
+                    if (reader < nodes.size() && live[reader])
+                        addEdge(reader, i);
         }
     }
     std::vector<bool> done(nodes.size(), false);
@@ -506,15 +617,17 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
             cell.access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
             cell.defined = image.initialized;
             cell.lastWrite = image.initialized;
+            cell.used = false;
         }
     for (auto& buffer : buffers)
-    {
-        buffer.state.layout = Layout::Undefined;
-        buffer.state.stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        buffer.state.access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
-        buffer.state.defined = buffer.initialized;
-        buffer.state.lastWrite = buffer.initialized;
-    }
+        for (auto& segment : buffer.segments)
+        {
+            segment.state.layout = Layout::Undefined;
+            segment.state.stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+            segment.state.access = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+            segment.state.defined = buffer.initialized;
+            segment.state.lastWrite = buffer.initialized;
+        }
     auto barrierFor = [](bool image, uint32_t resource, const Subresource& sub, const BufferRange& range,
                          const Cell& from, Layout target, StageAccess to)
     {
@@ -543,10 +656,10 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
             if (use.image)
             {
                 auto& image = images[use.resource];
-                auto [first, last] = cellRange(image, use.sub);
-                for (auto i = first; i <= last; ++i)
+                for (auto i : use.cells)
                 {
                     auto& cell = image.cells[i];
+                    cell.used = true;
                     // 未初始化读取只在活跃 pass 上诊断，避免被裁掉的声明报错。
                     if (!use.write && !cell.defined)
                         throw std::logic_error("Frame graph pass '" + nodes[pass].name +
@@ -567,14 +680,30 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
             else
             {
                 auto& buffer = buffers[use.resource];
-                auto hazard = use.write ? (buffer.state.defined || buffer.state.lastWrite)
-                                        : buffer.state.lastWrite;
-                if (hazard)
-                    entry.barriers.push_back(barrierFor(false, use.resource, {}, use.range, buffer.state,
-                                                        Layout::Undefined, stage));
-                buffer.state.stage = stage.stage;
-                buffer.state.access = stage.access;
-                buffer.state.lastWrite = use.write;
+                // 缓冲逐区间判定：只声明写了一半的缓冲，另一段仍是未定义内容。
+                // 段可能在声明结束后被合并，因此按"与区间相交"遍历，而不是按精确边界查找。
+                for (auto& piece : use.pieces)
+                {
+                    for (auto& segment : buffer.segments)
+                    {
+                        auto from = std::max(piece.first, segment.begin);
+                        auto to = std::min(piece.second, segment.end);
+                        if (from >= to)
+                            continue;
+                        if (!use.write && !segment.state.defined)
+                            throw std::logic_error("Frame graph pass '" + nodes[pass].name +
+                                                   "' reads uninitialized buffer " + buffer.name);
+                        auto hazard = use.write ? (segment.state.defined || segment.state.lastWrite)
+                                                : segment.state.lastWrite;
+                        if (hazard)
+                            entry.barriers.push_back(barrierFor(false, use.resource, {}, {from, to - from},
+                                                                segment.state, Layout::Undefined, stage));
+                        segment.state.stage = stage.stage;
+                        segment.state.access = stage.access;
+                        segment.state.lastWrite = use.write;
+                        segment.state.defined = segment.state.defined || use.write;
+                    }
+                }
             }
         }
         compiled.push_back(std::move(entry));
@@ -588,6 +717,9 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
         for (uint32_t i = 0; i < image.cells.size(); ++i)
         {
             auto& cell = image.cells[i];
+            // 本帧从未被访问的子资源保持原状：导出不应把无关 mip/layer 一起转换。
+            if (!cell.used)
+                continue;
             if (cell.layout == target && !cell.lastWrite)
                 continue;
             // 每个子资源单独收尾，已处于目标布局的 mip/layer 不会被重复转换。
@@ -609,9 +741,12 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
         if (!buffer.exported)
             continue;
         auto stage = stageAccess(Access::HostRead);
-        if (buffer.state.lastWrite)
-            final.push_back(barrierFor(false, uint32_t(&buffer - buffers.data()), {}, buffer.written, buffer.state,
-                                       Layout::Undefined, stage));
+        auto resource = uint32_t(&buffer - buffers.data());
+        // 只对本次真正写过的段收尾，未触碰的字节不产生屏障。
+        for (auto& segment : buffer.segments)
+            if (segment.state.lastWrite)
+                final.push_back(barrierFor(false, resource, {}, {segment.begin, segment.end - segment.begin},
+                                           segment.state, Layout::Undefined, stage));
     }
 }
 void FrameGraph::record(VkCommandBuffer cmd, const Barrier& barrier)

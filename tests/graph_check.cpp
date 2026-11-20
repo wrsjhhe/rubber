@@ -236,6 +236,272 @@ try
                "Export transition did not start from the attachment layout");
         expect(barrier.dstAccess == VK_ACCESS_MEMORY_READ_BIT, "Export consumer access is wrong");
     }
+    // 多 layer 的 mip 子范围：只应触及 mip1 的两层，压平成连续 cell 区间会误改无关子资源。
+    {
+        FrameGraph graph;
+        auto desc = color(64, 64, 4);
+        desc.layers = 2;
+        desc.usage = desc.usage | ImageUsage::TransferDst;
+        auto atlas = graph.createImage("atlas", desc);
+        auto p = graph.reserve("write-pair");
+        graph.addPass(p, [&](FrameGraph::Declaration& d) { d.write(atlas, Access::CopyDestination, {1, 1, 0, 2}); },
+                      [](VkCommandBuffer) {});
+        graph.exportImage(atlas, Layout::ShaderRead);
+        graph.compile();
+        std::vector<std::pair<uint32_t, uint32_t>> touched;
+        for (auto& barrier : graph.finalBarriers())
+        {
+            expect(barrier.sub.mipCount == 1 && barrier.sub.layerCount == 1,
+                   "Subresource range was not expanded per mip/layer");
+            touched.emplace_back(barrier.sub.layer, barrier.sub.mip);
+        }
+        expect(touched.size() == 2, "Multi-layer mip range touched extra subresources");
+        expect(std::find(touched.begin(), touched.end(), std::pair<uint32_t, uint32_t>{0, 1}) != touched.end(),
+               "Layer 0 mip 1 was not exported");
+        expect(std::find(touched.begin(), touched.end(), std::pair<uint32_t, uint32_t>{1, 1}) != touched.end(),
+               "Layer 1 mip 1 was not exported");
+    }
+    // 同图但读取未声明的 mip：压平实现会把它误标为已初始化。
+    {
+        FrameGraph graph;
+        auto desc = color(64, 64, 4);
+        desc.layers = 2;
+        desc.usage = desc.usage | ImageUsage::TransferDst;
+        auto atlas = graph.createImage("atlas", desc);
+        auto write = graph.reserve("write-pair"), read = graph.reserve("read-other-mip");
+        graph.addPass(write, [&](FrameGraph::Declaration& d) { d.write(atlas, Access::CopyDestination, {1, 1, 0, 2}); },
+                      [](VkCommandBuffer) {});
+        graph.addPass(
+            read,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(atlas, Access::Sampled, {2, 1, 0, 1});
+            },
+            [](VkCommandBuffer) {});
+        expectThrow([&] { graph.compile(); }, "reads uninitialized image atlas");
+    }
+    // 跨子资源的覆盖写：所有旧写入者都必须在覆写之前完成。
+    // 两个生产者各自还有别的产出（被导出），因此不会因"输出被完全覆写"而被裁掉；
+    // 覆写句柄按更小的下标预留，一旦漏掉某个生产者，调度器就会把它排到覆写之后。
+    {
+        FrameGraph graph;
+        auto image = graph.createImage("two-mips", color(64, 64, 2));
+        auto keepLow = graph.createImage("keep-low", color());
+        auto keepHigh = graph.createImage("keep-high", color());
+        auto overwrite = graph.reserve("overwrite");
+        auto low = graph.reserve("mip0"), high = graph.reserve("mip1");
+        graph.addPass(
+            low,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.write(image, Access::ColorWrite, {0, 1, 0, 1});
+                d.write(keepLow, Access::ColorWrite);
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            high,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.write(image, Access::ColorWrite, {1, 1, 0, 1});
+                d.write(keepHigh, Access::ColorWrite);
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            overwrite,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.write(image, Access::ColorWrite, {0, 2, 0, 1});
+            },
+            [](VkCommandBuffer) {});
+        graph.exportImage(keepLow, Layout::ShaderRead);
+        graph.exportImage(keepHigh, Layout::ShaderRead);
+        graph.exportImage(image, Layout::ShaderRead);
+        graph.compile();
+        expect(graph.activePasses() == std::vector<std::string>{"mip0", "mip1", "overwrite"},
+               "Cross-subresource WAW edge was lost");
+    }
+    // 跨子资源的读取者：只读了其中一个 mip 的 pass 也必须先于覆盖写完成。
+    // 读取者被显式 after 约束拖后，漏掉 WAR 边时覆写会插到它前面。
+    {
+        FrameGraph graph;
+        auto image = graph.importImage("history", color(64, 64, 2), Layout::ShaderRead, true);
+        auto unrelated = graph.createImage("unrelated", color());
+        auto overwrite = graph.reserve("overwrite"), hold = graph.reserve("hold"), late = graph.reserve("late");
+        graph.addPass(
+            hold,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(image, Access::Sampled, {0, 1, 0, 1});
+                d.after(late);
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            late,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.write(unrelated, Access::ColorWrite);
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            overwrite,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.write(image, Access::ColorWrite, {0, 2, 0, 1});
+            },
+            [](VkCommandBuffer) {});
+        graph.compile();
+        expect(graph.activePasses() == std::vector<std::string>{"late", "hold", "overwrite"},
+               "Cross-subresource WAR edge was lost");
+    }
+    // 缓冲：完全未写就读，编译期拒绝，而不是把未定义内容交给消费者。
+    {
+        FrameGraph graph;
+        auto scratch = graph.createBuffer("scratch", {256, BufferUsage::Storage});
+        auto p = graph.reserve("read-scratch");
+        graph.addPass(
+            p,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(scratch, Access::StorageRead, {0, 256});
+            },
+            [](VkCommandBuffer) {});
+        expectThrow([&] { graph.compile(); }, "reads uninitialized buffer scratch");
+    }
+    // 缓冲：只写了一半，另一段仍未定义；整体读取必须被拒绝。
+    {
+        FrameGraph graph;
+        auto half = graph.createBuffer("half", {64, BufferUsage::Storage | BufferUsage::TransferDst});
+        auto write = graph.reserve("write-half"), read = graph.reserve("read-all");
+        graph.addPass(write, [&](FrameGraph::Declaration& d) { d.write(half, Access::CopyDestination, {0, 32}); },
+                      [](VkCommandBuffer) {});
+        graph.addPass(
+            read,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(half, Access::StorageRead, {0, 0});
+            },
+            [](VkCommandBuffer) {});
+        expectThrow([&] { graph.compile(); }, "reads uninitialized buffer half");
+    }
+    // 缓冲：非重叠访问不构成冲突，屏障只覆盖各自声明的区间。
+    {
+        FrameGraph graph;
+        auto shared = graph.importBuffer("shared", {64, BufferUsage::Storage | BufferUsage::TransferDst}, true);
+        auto reader = graph.reserve("read-low"), writer = graph.reserve("write-high");
+        graph.addPass(
+            reader,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(shared, Access::StorageRead, {0, 32});
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(writer, [&](FrameGraph::Declaration& d) { d.write(shared, Access::CopyDestination, {32, 32}); },
+                      [](VkCommandBuffer) {});
+        graph.exportBuffer(shared);
+        graph.compile();
+        expect(graph.activePasses() == std::vector<std::string>{"read-low", "write-high"},
+               "Non-overlapping buffer accesses produced a false conflict");
+        for (auto& pass : graph.passes())
+            for (auto& barrier : pass.barriers)
+                if (!barrier.image)
+                {
+                    auto expected = pass.name == "read-low" ? 0u : 32u;
+                    expect(barrier.range.offset == expected && barrier.range.size == 32,
+                           "Buffer barrier covered bytes the pass never declared");
+                }
+    }
+    // 缓冲：两段各自写入后整体导出，两段的生产者都要保留。
+    {
+        FrameGraph graph;
+        auto split = graph.createBuffer("split", {64, BufferUsage::TransferDst | BufferUsage::HostRead});
+        auto low = graph.reserve("write-low"), high = graph.reserve("write-high");
+        graph.addPass(low, [&](FrameGraph::Declaration& d) { d.write(split, Access::CopyDestination, {0, 32}); },
+                      [](VkCommandBuffer) {});
+        graph.addPass(high, [&](FrameGraph::Declaration& d) { d.write(split, Access::CopyDestination, {32, 32}); },
+                      [](VkCommandBuffer) {});
+        graph.exportBuffer(split);
+        graph.compile();
+        expect(graph.activePasses() == std::vector<std::string>{"write-low", "write-high"},
+               "Buffer export only kept the last range producer");
+        std::vector<std::pair<uint64_t, uint64_t>> handed;
+        for (auto& barrier : graph.finalBarriers())
+            if (!barrier.image)
+                handed.emplace_back(barrier.range.offset, barrier.range.size);
+        expect(handed.size() == 2, "Buffer export did not cover both written ranges");
+    }
+    // 缓冲：跨区间覆盖写的 WAW 边要覆盖全部旧写入者。
+    // 两个生产者各自另有被导出的产出，所以不会因"结果被完全覆写"而被裁掉；
+    // 覆写的下标比其中一个生产者小，漏边时调度器会把它插到生产者之前。
+    {
+        FrameGraph graph;
+        auto buffer = graph.createBuffer("staging", {64, BufferUsage::TransferDst | BufferUsage::HostRead});
+        auto keepLow = graph.createBuffer("keep-low", {16, BufferUsage::TransferDst | BufferUsage::HostRead});
+        auto keepHigh = graph.createBuffer("keep-high", {16, BufferUsage::TransferDst | BufferUsage::HostRead});
+        auto last = graph.reserve("write-high"), overwrite = graph.reserve("overwrite"),
+             first = graph.reserve("write-low");
+        graph.addPass(
+            first,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.write(buffer, Access::CopyDestination, {0, 32});
+                d.write(keepLow, Access::CopyDestination, {0, 16});
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            last,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.write(buffer, Access::CopyDestination, {32, 32});
+                d.write(keepHigh, Access::CopyDestination, {0, 16});
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            overwrite,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.write(buffer, Access::CopyDestination, {0, 0});
+            },
+            [](VkCommandBuffer) {});
+        graph.exportBuffer(keepLow);
+        graph.exportBuffer(keepHigh);
+        graph.compile();
+        expect(graph.activePasses() == std::vector<std::string>{"write-high", "write-low", "overwrite"},
+               "Cross-range buffer WAW edge was lost");
+    }
+    // 缓冲：先读后写同一区间产生 WAR 边，覆写不能抢在读取之前。
+    {
+        FrameGraph graph;
+        auto buffer = graph.importBuffer("history", {64, BufferUsage::Storage | BufferUsage::TransferDst}, true);
+        auto overwrite = graph.reserve("overwrite"), hold = graph.reserve("hold");
+        graph.addPass(
+            hold,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.read(buffer, Access::StorageRead, {16, 16});
+            },
+            [](VkCommandBuffer) {});
+        graph.addPass(
+            overwrite,
+            [&](FrameGraph::Declaration& d)
+            {
+                d.sideEffect();
+                d.write(buffer, Access::CopyDestination, {0, 0});
+            },
+            [](VkCommandBuffer) {});
+        graph.compile();
+        expect(graph.activePasses() == std::vector<std::string>{"hold", "overwrite"},
+               "Cross-range buffer WAR edge was lost");
+    }
     std::cout << "PASS: frame graph culling, diagnostics, subresources and import/export\n";
     return 0;
 }
