@@ -24,6 +24,10 @@ void recordGeometry(VkCommandBuffer, const Pipelines&, VkDescriptorSet frame,
                     const std::vector<RenderScene::Item>&, const std::vector<uint32_t>& visible,
                     std::span<Image* const> colors, Image& depth, bool stable);
 void recordLighting(VkCommandBuffer, const Pipelines&, VkDescriptorSet frame, VkDescriptorSet inputs, Image& hdr);
+// 点云：实例化公告板。颜色链路写 HDR 与全部 G-buffer；几何真值链路只写 G-buffer 与深度。
+// 两条链路都对深度做测试并回写，因此点云与网格互相遮挡。
+void recordSplat(VkCommandBuffer, const Pipelines&, VkDescriptorSet frame, VkDescriptorSet points,
+                 std::span<Image* const> geometry, Image& depth, Image* hdr, uint32_t count, bool stable);
 void recordTemporal(VkCommandBuffer, const Pipelines&, VkDescriptorSet frame, VkDescriptorSet inputs,
                     Image& history);
 // 历史失效（首帧、重置、时间回退）时先清空再采样，避免读到未定义内容。

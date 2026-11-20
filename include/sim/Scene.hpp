@@ -43,6 +43,39 @@ Geometry CapsuleGeometry(float radius = 0.5f, float length = 1, unsigned segment
 Geometry TriangleMeshGeometry(std::vector<Vertex> vertices, std::vector<uint32_t> indices);
 Geometry ConvexGeometry(const std::vector<glm::vec3>& points);
 
+// 点云：位置、线性颜色、强度与半径。半径以世界单位表示，绘制时按透视投影换算成像素，
+// 因此同一份数据在不同分辨率、不同距离下保持物理尺寸一致。
+struct PointVertex
+{
+    glm::vec3 position;
+    float intensity;
+    glm::vec3 color;
+    float radius;
+};
+static_assert(sizeof(PointVertex) == 32);
+class BufferPointCloud
+{
+  public:
+    explicit BufferPointCloud(std::vector<PointVertex> points);
+    // 与几何同样在构造时一次算定：点数据、包围盒与最大半径都只读，
+    // 修改点云内容只能创建新对象，旧快照因此保持自己的剔除范围与上传内容。
+    const std::vector<PointVertex> points;
+    const AssetId id = nextAssetId();
+    const glm::vec3 minimum, maximum;
+    const float maxRadius = 0;
+
+  private:
+    struct Baked;
+    explicit BufferPointCloud(Baked&&);
+    static Baked bake(std::vector<PointVertex>);
+};
+using PointCloud = std::shared_ptr<const BufferPointCloud>;
+struct PointObject
+{
+    uint32_t id = 0;
+    PointCloud cloud;
+    glm::mat4 world{1};
+};
 struct Texture
 {
     Texture(uint32_t width, uint32_t height, std::vector<uint8_t> pixels);
@@ -88,12 +121,15 @@ struct SceneSnapshot
     DirectionalLight sun;
     std::vector<PointLight> lights;
     std::vector<Mesh> meshes;
+    // 点云与网格并列存在于同一快照：调度方按类型交给对应模块，不把点云伪装成三角网格。
+    std::vector<PointObject> points;
 };
 class Object3D
 {
   public:
     glm::mat4 local{1};
     Geometry geometry;
+    PointCloud cloud;
     MeshStandardMaterial material;
     bool castsShadow = true;
     uint32_t id() const
@@ -120,6 +156,8 @@ class Scene
     uint32_t add(Geometry geometry, const MeshStandardMaterial& material, glm::mat4 local = glm::mat4(1),
                  uint32_t parent = 0);
     uint32_t addGroup(glm::mat4 local = glm::mat4(1), uint32_t parent = 0);
+    // 点云节点与网格节点共用父子变换与稳定 ID，但不是网格：不参与三角绘制与阴影。
+    uint32_t addPoints(PointCloud cloud, glm::mat4 local = glm::mat4(1), uint32_t parent = 0);
     Object3D& get(uint32_t id);
     void remove(uint32_t id);
     SceneSnapshot snapshot(double time) const;

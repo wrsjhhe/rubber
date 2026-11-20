@@ -167,6 +167,10 @@ class FrameGraph
     {
         void read(ImageHandle, Access = Access::Sampled, Subresource = {});
         void write(ImageHandle, Access, Subresource = {});
+        // 读改写同一资源：混合、深度测试后写入、计算着色器的原地更新。
+        // 与"同一 pass 先 read 再 write"不同，这是一条合法声明，不构成反馈回路，
+        // 但仍然要求先前内容已定义，并保留对上一个写入者的依赖。
+        void readWrite(ImageHandle, Access, Subresource = {});
         void read(BufferHandle, Access = Access::StorageRead, BufferRange = {});
         void write(BufferHandle, Access, BufferRange = {});
         // 仅约束顺序，不涉及资源的显式依赖；矛盾时编译报循环。
@@ -250,7 +254,12 @@ class FrameGraph
         Subresource sub;
         BufferRange range;
         bool write = false;
+        bool readsBack = false; // 读改写：既消费先前内容又覆盖它
         Access access = Access::Sampled;
+        bool reads() const
+        {
+            return !write || readsBack;
+        }
         // 本次访问的精确子资源：图像为 cell 下标，缓冲为字节区间。声明期算定，plan 直接复用。
         std::vector<uint32_t> cells;
         std::vector<std::pair<uint64_t, uint64_t>> pieces;
@@ -302,7 +311,7 @@ class FrameGraph
     void mergeSegments(BufferResource&);
 
     Use& addUse(Declaration&, bool image, uint32_t resource, const Subresource&, const BufferRange&, bool write,
-                Access);
+                Access, bool readsBack = false);
     void validate(const PassNode&, const Use&) const;
     std::vector<bool> cull();
     std::vector<uint32_t> order(const std::vector<bool>&);

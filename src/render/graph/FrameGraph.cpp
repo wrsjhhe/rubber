@@ -171,6 +171,12 @@ void FrameGraph::Declaration::write(ImageHandle handle, Access access, Subresour
         throw std::logic_error("Frame graph write of an unknown image");
     graph->addUse(*this, true, handle.index, sub, {}, true, access);
 }
+void FrameGraph::Declaration::readWrite(ImageHandle handle, Access access, Subresource sub)
+{
+    if (!handle || handle.index >= graph->images.size())
+        throw std::logic_error("Frame graph read-write of an unknown image");
+    graph->addUse(*this, true, handle.index, sub, {}, true, access, true);
+}
 void FrameGraph::Declaration::read(BufferHandle handle, Access access, BufferRange range)
 {
     if (!handle || handle.index >= graph->buffers.size())
@@ -296,7 +302,7 @@ void FrameGraph::mergeSegments(BufferResource& buffer)
     buffer.segments = std::move(merged);
 }
 FrameGraph::Use& FrameGraph::addUse(Declaration& decl, bool image, uint32_t resource, const Subresource& sub,
-                                    const BufferRange& range, bool write, Access access)
+                                    const BufferRange& range, bool write, Access access, bool readsBack)
 {
     auto& node = nodes[decl.pass];
     Use use;
@@ -305,6 +311,7 @@ FrameGraph::Use& FrameGraph::addUse(Declaration& decl, bool image, uint32_t reso
     use.sub = sub;
     use.range = range;
     use.write = write;
+    use.readsBack = readsBack;
     use.access = access;
     if (image)
     {
@@ -537,7 +544,7 @@ std::vector<bool> FrameGraph::cull()
         auto pass = stack.back();
         stack.pop_back();
         for (auto& use : nodes[pass].uses)
-            if (!use.write)
+            if (use.reads())
                 for (auto writer : use.writers)
                     activate(writer);
     }
@@ -691,8 +698,9 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
                 {
                     auto& cell = image.cells[i];
                     cell.used = true;
-                    // 未初始化读取只在活跃 pass 上诊断，避免被裁掉的声明报错。
-                    if (!use.write && !cell.defined)
+                    // 未初始化读取只在活跃 pass 上诊断，避免被裁掉的声明报错；
+                    // 读改写同样消费先前内容，因此也要求已定义。
+                    if (use.reads() && !cell.defined)
                         throw std::logic_error("Frame graph pass '" + nodes[pass].name +
                                                "' reads uninitialized image " + image.name);
                     auto hazard = use.write ? (cell.defined || cell.lastWrite) : (cell.lastWrite);

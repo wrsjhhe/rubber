@@ -3,6 +3,10 @@
 #include "FrameData.hpp"
 #include "graph/FrameGraph.hpp"
 #include "passes/Passes.hpp"
+#include "GraphBridge.hpp"
+#include "Module.hpp"
+#include "../modules/mesh/MeshModule.hpp"
+#include "../modules/points/PointsModule.hpp"
 #include "../assets/AssetCache.hpp"
 #include "sim/VulkanInterop.hpp"
 #include <glm/gtc/matrix_transform.hpp>
@@ -20,88 +24,6 @@ namespace sim
 using namespace vk;
 namespace
 {
-VkFormat vkFormatOf(render::Format format)
-{
-    switch (format)
-    {
-    case render::Format::Rgba8Unorm:
-        return colorFormat;
-    case render::Format::Rgba16Float:
-        return hdrFormat;
-    case render::Format::R32Float:
-        return VK_FORMAT_R32_SFLOAT;
-    case render::Format::R32Uint:
-        return VK_FORMAT_R32_UINT;
-    case render::Format::D32Float:
-        return depthFormat;
-    }
-    return VK_FORMAT_UNDEFINED;
-}
-VkImageUsageFlags vkUsageOf(render::ImageUsage usage)
-{
-    VkImageUsageFlags flags = 0;
-    if (has(usage, render::ImageUsage::Sampled))
-        flags |= VK_IMAGE_USAGE_SAMPLED_BIT;
-    if (has(usage, render::ImageUsage::ColorAttachment))
-        flags |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    if (has(usage, render::ImageUsage::DepthAttachment))
-        flags |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    if (has(usage, render::ImageUsage::TransferSrc))
-        flags |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (has(usage, render::ImageUsage::TransferDst))
-        flags |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    return flags;
-}
-VkBufferUsageFlags vkUsageOf(render::BufferUsage usage)
-{
-    VkBufferUsageFlags flags = 0;
-    if (has(usage, render::BufferUsage::Uniform))
-        flags |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-    if (has(usage, render::BufferUsage::Storage))
-        flags |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    if (has(usage, render::BufferUsage::TransferSrc))
-        flags |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    if (has(usage, render::BufferUsage::TransferDst))
-        flags |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    return flags;
-}
-// 视图资源对象记录的是实际 VkImageLayout；导入时换算成帧图的声明层枚举。
-render::Layout graphLayout(VkImageLayout layout)
-{
-    switch (layout)
-    {
-    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
-        return render::Layout::ColorAttachment;
-    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
-        return render::Layout::DepthAttachment;
-    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
-        return render::Layout::ShaderRead;
-    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
-        return render::Layout::TransferSrc;
-    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
-        return render::Layout::TransferDst;
-    default:
-        return render::Layout::Undefined;
-    }
-}
-render::ImageDesc imageDesc(render::Format format, uint32_t width, uint32_t height, render::ImageUsage usage,
-                            render::Aspect aspect = render::Aspect::Color)
-{
-    render::ImageDesc desc;
-    desc.format = format;
-    desc.width = width;
-    desc.height = height;
-    desc.aspect = aspect;
-    desc.usage = usage;
-    return desc;
-}
-// 视图资源的声明用途：G-buffer 与显示类都要能被采样、作为附件写入和拷贝出去。
-constexpr render::ImageUsage colorUsage = render::ImageUsage::Sampled | render::ImageUsage::ColorAttachment |
-                                          render::ImageUsage::TransferSrc;
-constexpr render::ImageUsage depthUsage = render::ImageUsage::Sampled | render::ImageUsage::DepthAttachment |
-                                          render::ImageUsage::TransferSrc;
-// 历史槽需要被采样、被解析结果写入，并在失效时清除。
-constexpr render::ImageUsage historyUsage = colorUsage | render::ImageUsage::TransferDst;
 uint64_t imageKey(const render::ImageDesc& desc)
 {
     uint64_t key = 1469598103934665603ull;
@@ -124,7 +46,7 @@ uint64_t bufferKey(const render::BufferDesc& desc)
     return desc.size * 131 + uint64_t(desc.usage);
 }
 }
-struct Renderer::Impl
+struct Renderer::Impl final : AssetProvider
 {
     Device d;
     Lifetime life;
@@ -134,8 +56,9 @@ struct Renderer::Impl
     std::shared_ptr<AssetCache> assets;
     // 已切换但仍有在途帧或视图引用的旧缓存代际，待最后一个引用消失后释放。
     std::vector<std::shared_ptr<AssetCache>> retired;
-    std::unordered_map<uint64_t, std::weak_ptr<RenderScene>> scenes;
-    uint64_t nextGeneration = 0, nextSceneVersion = 0;
+    // 模块按接口注册：主调度只遍历，不判断类型。
+    std::vector<std::unique_ptr<RenderModule>> modules;
+    uint64_t nextGeneration = 0;
     explicit Impl(const DeviceOptions& o)
     {
         d.init(o);
@@ -143,23 +66,19 @@ struct Renderer::Impl
             o.shaderDirectory.empty() ? std::filesystem::path(RENDERER_SHADER_DIR) : o.shaderDirectory;
         pipelines = std::make_unique<Pipelines>(d, shaderDirectory);
         assets = std::make_shared<AssetCache>(d, *pipelines, stats, ++nextGeneration);
+        modules.push_back(std::make_unique<MeshModule>(d, *pipelines, *this, stats));
+        modules.push_back(std::make_unique<PointsModule>(d, *pipelines));
     }
-    // 键相同且内容一致的快照复用同一份共享场景，因此同快照的多台相机只准备与上传一次。
-    std::shared_ptr<RenderScene> prepare(const SceneSnapshot& scene)
+    std::shared_ptr<AssetCache> currentAssets() override
+    {
+        return assets;
+    }
+    // 快照准备交给各模块：同一内容的多台相机仍只准备与上传一次。
+    void prepare(const SceneSnapshot& scene, FrameLifetime& frame)
     {
         collect();
-        auto key = sceneKey(scene, assets->generation);
-        if (auto it = scenes.find(key); it != scenes.end())
-            if (auto live = it->second.lock(); live && live->matches(scene))
-            {
-                ++stats.sceneReuses;
-                return live;
-            }
-        auto prepared = std::make_shared<RenderScene>(d, assets, scene, ++nextSceneVersion);
-        scenes[key] = prepared;
-        ++stats.scenePreparations;
-        std::erase_if(scenes, [](const auto& entry) { return entry.second.expired(); });
-        return prepared;
+        for (auto& module : modules)
+            module->prepare(scene, frame);
     }
     void collect()
     {
@@ -174,7 +93,8 @@ struct Renderer::Impl
     {
         retired.push_back(assets);
         assets = std::make_shared<AssetCache>(d, *pipelines, stats, ++nextGeneration);
-        scenes.clear();
+        for (auto& module : modules)
+            module->invalidateAssets();
         collect();
     }
     AssetStats statsOf() const
@@ -195,8 +115,8 @@ struct Renderer::Impl
 struct FrameResult::Impl
 {
     std::shared_ptr<Renderer::Impl> owner;
-    // 结果持有产生它的共享场景，保证 GPU 完成前资产与实例数据存活。
-    std::shared_ptr<RenderScene> scene;
+    // 结果持有产生它的帧共享数据，保证 GPU 完成前资产与实例缓冲存活。
+    std::shared_ptr<vk::FrameLifetime> frame;
     Lifetime life;
     std::vector<OutputInfo> infos;
     std::vector<Img> images;
@@ -277,27 +197,34 @@ struct View::Impl
     Pipelines& pipe;
     Lifetime life;
     uint32_t w, h, tile;
-    Img g[5], depth, shadow, hdr, history[2], display;
+    Img g[5], depth, hdr, history[2], display;
     std::vector<std::weak_ptr<FrameResult>> results;
     std::weak_ptr<FrameResult> pendingExport;
-    // 视图只保留相机相关状态：当前共享场景、上一帧变换与历史。
-    std::shared_ptr<RenderScene> scene;
-    Buf globals, viewData;
+    // 视图只保留相机相关状态：帧级共享资源、历史与模块的视图侧状态。
+    Buf globals;
     VkCommandBuffer cmd{};
     VkFence fence{};
-    VkDescriptorSet frame{}, lighting{}, resolve[2]{}, colorSet[2]{};
-    unsigned number = 0, visibleCount = 0;
+    VkDescriptorSet frame{}, resolve[2]{}, colorSet[2]{};
+    // 每个模块一份视图状态（阴影图、实例历史、点云描述符），由模块自己创建。
+    std::vector<std::unique_ptr<vk::ModuleView>> modules;
+    vk::FrameStats stats;
+    unsigned number = 0, visibleCount = 0, pointCount = 0;
+    // 没有结果对象时，本帧的共享数据由视图保活到下一次等待完成。
+    std::shared_ptr<vk::FrameLifetime> retained;
     // 历史槽的奇偶只随真正写入历史的帧前进：不参与 TAA 的请求不能让历史失效或换槽。
     unsigned historyNumber = 0;
     double time = 0;
     bool hasReadback = false, lastTaa = false;
+    unsigned historySlot() const
+    {
+        return historyNumber % 2;
+    }
     int lastChannel = 0;
     glm::mat4 lastVP{1};
     unsigned stillSamples = 0;
     DirectionalLight lastSun;
     std::vector<PointLight> lastLights;
     bool lastShadows = false;
-    std::unordered_map<uint32_t, MeshHistory> lastModels;
     // 帧图与瞬时资源：声明由帧图产生，分配与释放留在执行侧。
     render::FrameGraph graph;
     std::vector<std::pair<uint64_t, Img>> transientImages;
@@ -327,6 +254,16 @@ struct View::Impl
         ci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         check(vkCreateFence(d.device, &ci, nullptr, &fence), "frame fence");
         life.release.push_back([this] { vkDestroyFence(d.device, fence, nullptr); });
+        // 模块视图只拿到设备、管线、帧描述符集合与尺寸，不接触视图的其余状态。
+        vk::ModuleViewDesc desc;
+        desc.device = &d;
+        desc.pipelines = &pipe;
+        desc.frameSet = frame;
+        desc.width = w;
+        desc.height = h;
+        desc.shadowTile = tile;
+        for (auto& module : owner->modules)
+            modules.push_back(module->view(desc));
     }
     ~Impl()
     {
@@ -335,34 +272,16 @@ struct View::Impl
         if (number)
             vkWaitForFences(d.device, 1, &fence, VK_TRUE, UINT64_MAX);
     }
-    // 共享场景的缓冲与视图历史只在等待本视图上一帧后重新绑定。
-    void useScene(const std::shared_ptr<RenderScene>& next)
-    {
-        if (scene == next)
-            return;
-        scene = next;
-        auto bytes = std::max<size_t>(1, scene->items().size()) * sizeof(ViewInstance);
-        if (!viewData || viewData->size < bytes)
-            viewData = d.buffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
-        bindBuffer(d, frame, 1, scene->instances(), VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-        bindBuffer(d, frame, 2, *viewData, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-    }
     void ensureColor()
     {
         if (display)
             return;
         // 与导入声明共用同一组 usage 常量：历史槽额外带 TRANSFER_DST，供失效时的清除使用。
-        shadow = d.image(tile * 2, tile * 2, depthFormat, vkUsageOf(depthUsage));
         hdr = d.image(w, h, hdrFormat, vkUsageOf(colorUsage));
         display = d.image(w, h, colorFormat, vkUsageOf(colorUsage));
         for (auto& img : history)
             img = d.image(w, h, hdrFormat, vkUsageOf(historyUsage));
-        auto pool = descriptorPool(d, life, 8);
-        lighting = allocateSet(d, pool, pipe.lighting);
-        for (unsigned i = 0; i < 5; ++i)
-            bindImage(d, lighting, i, *g[i], pipe.point);
-        bindImage(d, lighting, 5, *depth, pipe.point);
-        bindImage(d, lighting, 6, *shadow, pipe.point);
+        auto pool = descriptorPool(d, life, 4);
         for (unsigned i = 0; i < 2; ++i)
         {
             resolve[i] = allocateSet(d, pool, pipe.resolve);
@@ -489,8 +408,9 @@ Submission Renderer::submit(const RenderRequest& request)
     std::erase_if(v.results, [](const auto& result) { return result.expired(); });
     if (v.results.size() >= 3)
         return {};
-    // 同内容快照在此复用同一份共享场景，两台相机不会重复准备或上传。
-    auto prepared = impl->prepare(request.scene);
+    // 同内容快照在此复用同一份共享数据，两台相机不会重复准备或上传。
+    auto frame = std::make_shared<vk::FrameLifetime>();
+    impl->prepare(request.scene, *frame);
 
     auto state = std::make_shared<FrameResult::Impl>(impl);
     state->timestamp = request.scene.time;
@@ -532,7 +452,7 @@ Submission Renderer::submit(const RenderRequest& request)
         options.taa = false;
         options.shadows = false;
     }
-    renderFrame(prepared, request.scene, request.camera, request.view, options, color, channels);
+    renderFrame(*frame, request.scene, request.camera, request.view, options, color, channels);
 
     auto cmd = state->command;
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -560,8 +480,9 @@ Submission Renderer::submit(const RenderRequest& request)
     }
     check(vkEndCommandBuffer(cmd), "end output export");
     auto result = std::shared_ptr<FrameResult>(new FrameResult(state));
-    // 结果与视图共同持有共享场景，GPU 完成前资产与实例数据不会被回收。
-    state->scene = prepared;
+    // 结果与视图共同持有本帧的共享数据，GPU 完成前资产与实例缓冲不会被回收。
+    state->frame = frame;
+    v.retained = frame;
     v.results.push_back(result);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
@@ -622,6 +543,10 @@ uint32_t View::visibleMeshes() const
 {
     return impl->visibleCount;
 }
+uint32_t View::visiblePoints() const
+{
+    return impl->pointCount;
+}
 Frame View::read() const
 {
     auto& v = *impl;
@@ -650,9 +575,13 @@ void Renderer::render(const SceneSnapshot& scene, const PerspectiveCamera& camer
         channels.push_back(Channel::MetricDepth);
         channels.push_back(Channel::InstanceId);
     }
-    renderFrame(impl->prepare(scene), scene, camera, view, o, true, channels);
+    auto frame = std::make_shared<vk::FrameLifetime>();
+    impl->prepare(scene, *frame);
+    renderFrame(*frame, scene, camera, view, o, true, channels);
+    // 没有结果对象持有本帧的共享数据：由视图保活到下一次等待完成。
+    view.impl->retained = frame;
 }
-void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const SceneSnapshot& snapshot,
+void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& snapshot,
                            const PerspectiveCamera& camera, View& view, const RenderOptions& o, bool color,
                            const std::vector<Channel>& exports)
 {
@@ -661,17 +590,12 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
         throw std::invalid_argument("View belongs to a different renderer");
     if (snapshot.lights.size() > 16 || glm::length(snapshot.sun.direction) < 1e-6f)
         throw std::invalid_argument("Invalid lights");
-    if (scene->items().size() != snapshot.meshes.size())
-        throw std::invalid_argument("Scene does not match snapshot");
     view.wait();
     if (color)
         v.ensureColor();
-    // 本视图上一帧已完成，此时才能替换共享平台缓冲与描述符绑定，也能安全回收瞬时资源。
-    v.useScene(scene);
-    // 上一帧已等待完成，可以先回收未被引用的瞬时资源，再开始本帧的声明。
+    // 上一帧已等待完成，此时才能替换共享平台缓冲与描述符绑定，也能安全回收瞬时资源。
     v.sweepTransients();
     v.beginTransients();
-    auto& items = scene->items();
 
     Globals f{};
     f.vp = camera.projection(v.w, v.h) * camera.view();
@@ -685,7 +609,6 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
     accumulate = accumulate && snapshot.sun.direction == v.lastSun.direction &&
                  snapshot.sun.radiance == v.lastSun.radiance && sameLights(snapshot.lights, v.lastLights) &&
                  o.shadows == v.lastShadows;
-    bool stationary = accumulate && f.vp == v.lastVP && items.size() == v.lastModels.size();
     auto index = (v.number % temporalSamples) + 1;
     glm::vec2 jitter =
         o.taa ? glm::vec2((2 * halton(index, 2) - 1) / v.w, (2 * halton(index, 3) - 1) / v.h) : glm::vec2(0);
@@ -698,40 +621,7 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
         f.pointColor[i] = {snapshot.lights[i].intensity, 1};
     }
 
-    auto rasterVP = f.vp;
-    for (unsigned j = 0; j < 4; ++j)
-    {
-        rasterVP[j].x += jitter.x * rasterVP[j].w;
-        rasterVP[j].y += jitter.y * rasterVP[j].w;
-    }
-    std::vector<uint32_t> visibleList;
-    std::unordered_map<uint32_t, MeshHistory> models;
-    for (uint32_t i = 0; i < items.size(); ++i)
-    {
-        auto& item = items[i];
-        auto prev = v.lastModels.find(item.id);
-        MeshHistory state{item.world, item.geometry, item.material, item.castsShadow, i};
-        if (!models.emplace(item.id, state).second)
-            throw std::invalid_argument("Duplicate snapshot mesh ID");
-        // 资产身份或材质值变化即视为新对象：既不能复用旧姿态，也不能继续冻结历史。
-        bool known = prev != v.lastModels.end() && prev->second.geometry == item.geometry &&
-                     prev->second.material == item.material;
-        stationary = stationary && known && prev->second == state;
-        // 视图只写上一帧变换与匹配标记；当前变换来自共享场景的静态实例数据。
-        ViewInstance history{known ? prev->second.world : item.world, {0, uint32_t(known), 0, 0}};
-        std::memcpy(static_cast<char*>(v.viewData->mapped) + i * sizeof(history), &history, sizeof(history));
-        if (!o.culling || visible(item.world, item.minimum, item.maximum, f.vp) ||
-            (o.taa && visible(item.world, item.minimum, item.maximum, rasterVP)))
-            visibleList.push_back(i);
-    }
-    if (color && o.shadows)
-        fitShadows(f, camera, items, v.tile);
-    // 静止时逐像素平均一个完整抖动周期，保留前景与背景各自的覆盖贡献。
-    f.info.w = stationary ? (v.stillSamples < temporalSamples ? 1.f / (v.stillSamples + 1) : 0.f) : -1.f;
-    std::memcpy(v.globals->mapped, &f, sizeof(f));
-    unsigned slot = v.historyNumber % 2;
-
-    // 帧图：导入持久资源、声明 pass、导出请求的输出。分配与录制由帧图执行阶段驱动。
+    // 帧图：导入持久资源，再把帧级资源交给各模块声明自己的 pass。
     using render::Access;
     using render::Layout;
     auto& graph = v.graph;
@@ -741,20 +631,18 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
     const auto normalRough = graph.importImage("normal-rough",
                                                imageDesc(render::Format::Rgba16Float, v.w, v.h, colorUsage),
                                                graphLayout(v.g[1]->layout), false);
-    const auto motion =
-        graph.importImage("motion", imageDesc(render::Format::Rgba16Float, v.w, v.h, colorUsage), graphLayout(v.g[2]->layout),
-                          false);
-    const auto metric =
-        graph.importImage("metric-depth", imageDesc(render::Format::R32Float, v.w, v.h, colorUsage), graphLayout(v.g[3]->layout),
-                          false);
+    const auto motion = graph.importImage("motion", imageDesc(render::Format::Rgba16Float, v.w, v.h, colorUsage),
+                                          graphLayout(v.g[2]->layout), false);
+    const auto metric = graph.importImage("metric-depth",
+                                          imageDesc(render::Format::R32Float, v.w, v.h, colorUsage),
+                                          graphLayout(v.g[3]->layout), false);
     const auto instanceId = graph.importImage("instance-id",
-                                              imageDesc(render::Format::R32Uint, v.w, v.h, colorUsage), graphLayout(v.g[4]->layout),
-                                              false);
+                                              imageDesc(render::Format::R32Uint, v.w, v.h, colorUsage),
+                                              graphLayout(v.g[4]->layout), false);
     const auto depthImage = graph.importImage(
         "hardware-depth", imageDesc(render::Format::D32Float, v.w, v.h, depthUsage, render::Aspect::Depth),
         graphLayout(v.depth->layout), false);
     const auto globalsBuffer = graph.importBuffer("globals", {sizeof(Globals), render::BufferUsage::Uniform}, true);
-    const auto viewBuffer = graph.importBuffer("view-history", {v.viewData->size, render::BufferUsage::Storage}, true);
     graph.bind(albedo, *v.g[0]);
     graph.bind(normalRough, *v.g[1]);
     graph.bind(motion, *v.g[2]);
@@ -762,14 +650,10 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
     graph.bind(instanceId, *v.g[4]);
     graph.bind(depthImage, *v.depth);
     graph.bind(globalsBuffer, *v.globals);
-    graph.bind(viewBuffer, *v.viewData);
     // 颜色相关资源只在请求颜色时才导入：几何请求不分配也不需要它们。
-    render::ImageHandle shadowMap, hdrImage, displayImage, historyImage[2];
+    render::ImageHandle hdrImage, displayImage, historyImage[2];
     if (color)
     {
-        shadowMap = graph.importImage(
-            "shadow", imageDesc(render::Format::D32Float, v.tile * 2, v.tile * 2, depthUsage, render::Aspect::Depth),
-            graphLayout(v.shadow->layout), true);
         hdrImage = graph.importImage("hdr", imageDesc(render::Format::Rgba16Float, v.w, v.h, colorUsage),
                                      graphLayout(v.hdr->layout), false);
         displayImage = graph.importImage("display", imageDesc(render::Format::Rgba8Unorm, v.w, v.h, colorUsage),
@@ -777,8 +661,7 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
         for (int i = 0; i < 2; ++i)
             historyImage[i] = graph.importImage("history-" + std::to_string(i),
                                                 imageDesc(render::Format::Rgba16Float, v.w, v.h, historyUsage),
-                                                graphLayout(v.history[i]->layout), i == 1 - slot ? accumulate : false);
-        graph.bind(shadowMap, *v.shadow);
+                                                graphLayout(v.history[i]->layout), i == 1 - v.historySlot() && accumulate);
         graph.bind(hdrImage, *v.hdr);
         graph.bind(displayImage, *v.display);
         graph.bind(historyImage[0], *v.history[0]);
@@ -787,61 +670,52 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
     const auto stagingBuffer = graph.createBuffer(
         "readback", {VkDeviceSize(v.w) * v.h * 12, render::BufferUsage::TransferDst | render::BufferUsage::HostRead});
 
-    std::array<Image*, 5> targets{v.g[0].get(), v.g[1].get(), v.g[2].get(), v.g[3].get(), v.g[4].get()};
-    auto declareTargets = [&](render::FrameGraph::Declaration& d)
-    {
-        d.write(albedo, Access::ColorWrite);
-        d.write(normalRough, Access::ColorWrite);
-        d.write(motion, Access::ColorWrite);
-        d.write(metric, Access::ColorWrite);
-        d.write(instanceId, Access::ColorWrite);
-        d.write(depthImage, Access::DepthWrite);
-        d.read(globalsBuffer, Access::UniformRead);
-        d.read(viewBuffer, Access::StorageRead);
-    };
-    auto historyClearPass = graph.reserve("history.clear");
-    auto shadowPass = graph.reserve("shadow");
-    auto geometryPass = graph.reserve("geometry");
-    auto stablePass = graph.reserve("geometry.stable");
-    auto lightingPass = graph.reserve("lighting");
-    auto temporalPass = graph.reserve("temporal");
-    auto colorPass = graph.reserve("color");
-    auto readbackPass = graph.reserve("readback");
-    bool stable = color && o.taa && (o.readback || o.stableGeometry);
+    vk::FrameResources res;
+    res.graph = &graph;
+    res.albedo = {albedo, v.g[0].get()};
+    res.normalRough = {normalRough, v.g[1].get()};
+    res.motion = {motion, v.g[2].get()};
+    res.metricDepth = {metric, v.g[3].get()};
+    res.instanceId = {instanceId, v.g[4].get()};
+    res.hardwareDepth = {depthImage, v.depth.get()};
+    res.hdr = {hdrImage, v.hdr.get()};
+    res.display = {displayImage, v.display.get()};
+    res.history[0] = {historyImage[0], v.history[0].get()};
+    res.history[1] = {historyImage[1], v.history[1].get()};
+    res.globals = {globalsBuffer, v.globals.get()};
+    res.constants = &f;
+    res.options = &o;
+    res.camera = &camera;
+    res.frameSet = v.frame;
+    res.width = v.w;
+    res.height = v.h;
+    res.shadowTile = v.tile;
+    res.color = color;
+    res.stable = color && o.taa && (o.readback || o.stableGeometry);
+
+    unsigned slot = v.historySlot();
     // 历史失效时先清除再采样：既保证定义内容，也让验证层看到合法布局。
+    // 它只写历史槽，与模块无关，因此在模块声明前先排定。
     if (color && !accumulate)
         graph.addPass(
-            historyClearPass,
-            [&](render::FrameGraph::Declaration& d)
-            { d.write(historyImage[1 - slot], Access::CopyDestination); },
+            graph.reserve("history.clear"),
+            [&](render::FrameGraph::Declaration& d) { d.write(historyImage[1 - slot], Access::CopyDestination); },
             [&](VkCommandBuffer cmd) { recordHistoryClear(cmd, *v.history[1 - slot]); });
-    if (color && o.shadows)
-        graph.addPass(
-            shadowPass, [&](render::FrameGraph::Declaration& d) { d.write(shadowMap, Access::DepthWrite); },
-            [&](VkCommandBuffer cmd) { recordShadow(cmd, v.pipe, v.frame, *v.shadow, items, f, v.tile); });
-    graph.addPass(
-        geometryPass, declareTargets,
-        [&](VkCommandBuffer cmd)
-        { recordGeometry(cmd, v.pipe, v.frame, items, visibleList, targets, *v.depth, false); });
+    // 模块按接口声明自己的 pass：主调度不判断网格或点云。
+    v.stats = {};
+    for (auto& module : v.modules)
+        module->declare(res, v.stats);
+    // 静止冻结要求相机与所有模块的输入都与上一帧相同；仍要有一个完整抖动周期。
+    bool stationary = accumulate && f.vp == v.lastVP;
+    for (auto& module : v.modules)
+        stationary = stationary && module->unchanged();
+    // 静止时逐像素平均一个完整抖动周期，保留前景与背景各自的覆盖贡献。
+    f.info.w = stationary ? (v.stillSamples < temporalSamples ? 1.f / (v.stillSamples + 1) : 0.f) : -1.f;
+    std::memcpy(v.globals->mapped, &f, sizeof(f));
+
     if (color)
         graph.addPass(
-            lightingPass,
-            [&](render::FrameGraph::Declaration& d)
-            {
-                d.read(albedo);
-                d.read(normalRough);
-                d.read(motion);
-                d.read(metric);
-                d.read(instanceId);
-                d.read(depthImage);
-                d.read(shadowMap);
-                d.read(globalsBuffer, Access::UniformRead);
-                d.write(hdrImage, Access::ColorWrite);
-            },
-            [&](VkCommandBuffer cmd) { recordLighting(cmd, v.pipe, v.frame, v.lighting, *v.hdr); });
-    if (color)
-        graph.addPass(
-            temporalPass,
+            graph.reserve("temporal"),
             [&](render::FrameGraph::Declaration& d)
             {
                 d.read(hdrImage);
@@ -858,7 +732,7 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
             { recordTemporal(cmd, v.pipe, v.frame, v.resolve[slot], *v.history[slot]); });
     if (color)
         graph.addPass(
-            colorPass,
+            graph.reserve("color"),
             [&](render::FrameGraph::Declaration& d)
             {
                 d.read(historyImage[slot]);
@@ -866,31 +740,25 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
                 d.write(displayImage, Access::ColorWrite);
             },
             [&](VkCommandBuffer cmd) { recordColor(cmd, v.pipe, v.frame, v.colorSet[slot], *v.display); });
-    // 稳定几何排在时序解析与颜色变换之后：它覆盖 G-buffer 供真值读回，
-    // 不能抢在 TAA 之前把抖动样本换成像素中心样本。
-    if (stable)
-        graph.addPass(
-            stablePass, declareTargets,
-            [&](VkCommandBuffer cmd)
-            { recordGeometry(cmd, v.pipe, v.frame, items, visibleList, targets, *v.depth, true); });
+    // 第二阶段：几何真值写回必须晚于时序解析与颜色变换。
+    for (auto& module : v.modules)
+        module->declareLate(res, v.stats);
+
     if (o.readback)
-    {
-        auto bytes = VkDeviceSize(v.w) * v.h * 4;
         graph.addPass(
-            readbackPass,
+            graph.reserve("readback"),
             [&](render::FrameGraph::Declaration& d)
             {
                 d.read(displayImage, Access::CopySource);
                 d.read(metric, Access::CopySource);
                 d.read(instanceId, Access::CopySource);
-                d.write(stagingBuffer, Access::CopyDestination, {0, bytes * 3});
+                d.write(stagingBuffer, Access::CopyDestination, {0, VkDeviceSize(v.w) * v.h * 12});
             },
             [&](VkCommandBuffer cmd)
             {
                 std::array<Image*, 3> copies{v.display.get(), v.g[3].get(), v.g[4].get()};
                 recordReadback(cmd, copies, *v.staging, v.w, v.h);
             });
-    }
     // 导出只覆盖本次请求的通道；恢复声明让持久视图资源在帧末回到只读，供下一帧导入。
     auto handleOf = [&](Channel channel)
     {
@@ -921,18 +789,14 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
     for (auto handle : {albedo, normalRough, motion, metric, instanceId, depthImage})
         graph.restoreImage(handle, Layout::ShaderRead);
     if (color)
-    {
         for (auto handle : {hdrImage, displayImage, historyImage[0], historyImage[1]})
             graph.restoreImage(handle, Layout::ShaderRead);
-    }
     graph.compile();
     // 编译结果决定实际需要的瞬时资源：只分配存活的声明。
     for (auto& entry : graph.transients())
     {
         if (entry.image)
-        {
             graph.bind(render::ImageHandle{entry.resource}, *v.transientImage(entry.imageDesc));
-        }
         else
         {
             auto& buffer = *v.transientBuffer(entry.bufferDesc);
@@ -949,8 +813,8 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
     graph.execute(v.cmd);
     check(vkEndCommandBuffer(v.cmd), "end frame");
     v.activePasses = graph.activePasses();
-    // 首次出现的资产上传与本帧在同一队列上，用时间线值声明提交依赖。
-    auto uploads = scene->uploads();
+    // 模块登记的首次上传与本帧在同一队列上，用时间线值声明提交依赖。
+    auto uploads = frame.uploads();
     VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
     VkPipelineStageFlags uploadStage = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
@@ -978,14 +842,14 @@ void Renderer::renderFrame(const std::shared_ptr<RenderScene>& scene, const Scen
         v.lastSun = snapshot.sun;
         v.lastLights = snapshot.lights;
         v.lastShadows = o.shadows;
-        v.lastModels = std::move(models);
         v.lastTaa = o.taa;
         v.lastChannel = o.debugChannel;
         v.time = snapshot.time;
         ++v.historyNumber;
     }
     v.hasReadback = o.readback;
-    v.visibleCount = uint32_t(visibleList.size());
+    v.visibleCount = v.stats.visibleMeshes;
+    v.pointCount = v.stats.visiblePoints;
     ++v.number;
 }
 }

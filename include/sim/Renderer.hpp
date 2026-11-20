@@ -10,6 +10,7 @@ namespace sim
 namespace vk
 {
 class RenderScene;
+class FrameLifetime;
 }
 struct DeviceOptions
 {
@@ -54,6 +55,8 @@ class View
     VkImageView colorView() const;
     VkImageView imageView(Channel channel) const;
     uint32_t visibleMeshes() const;
+    // 本帧提交绘制的点数；点云不在 CPU 侧剔除，因此等于快照中的点数。
+    uint32_t visiblePoints() const;
     // 上一帧帧图实际执行的 pass 清单（按执行顺序），用于确认按需裁剪。
     const std::vector<std::string>& activePasses() const;
 
@@ -102,8 +105,8 @@ class Renderer
   private:
     friend class View;
     friend class FrameResult;
-    void renderFrame(const std::shared_ptr<vk::RenderScene>&, const SceneSnapshot&, const PerspectiveCamera&,
-                     View&, const RenderOptions&, bool color, const std::vector<Channel>& exports);
+    void renderFrame(const vk::FrameLifetime&, const SceneSnapshot&, const PerspectiveCamera&, View&,
+                     const RenderOptions&, bool color, const std::vector<Channel>& exports);
     struct Impl;
     std::shared_ptr<Impl> impl;
 };

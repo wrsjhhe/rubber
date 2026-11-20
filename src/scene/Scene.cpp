@@ -100,6 +100,42 @@ Geometry TriangleMeshGeometry(std::vector<Vertex> v, std::vector<uint32_t> i)
 {
     return std::make_shared<BufferGeometry>(std::move(v), std::move(i));
 }
+// 点云与几何同构：内容、包围盒与最大半径在构造时一次算定，之后全部只读。
+struct BufferPointCloud::Baked
+{
+    std::vector<PointVertex> points;
+    glm::vec3 minimum{}, maximum{};
+    float maxRadius = 0;
+};
+BufferPointCloud::Baked BufferPointCloud::bake(std::vector<PointVertex> points)
+{
+    require(!points.empty(), "Expected at least one point");
+    Baked baked;
+    baked.points = std::move(points);
+    baked.minimum = baked.maximum = baked.points.front().position;
+    for (auto& point : baked.points)
+    {
+        require(finite(point.position) && finite(point.color), "Non-finite point");
+        require(std::isfinite(point.intensity) && point.intensity >= 0, "Invalid point intensity");
+        require(std::isfinite(point.radius) && point.radius > 0, "Invalid point radius");
+        baked.minimum = glm::min(baked.minimum, point.position);
+        baked.maximum = glm::max(baked.maximum, point.position);
+        // 剔除与投影都按球体处理，包围盒与像素尺寸都要带上最大半径。
+        baked.maxRadius = std::max(baked.maxRadius, point.radius);
+    }
+    baked.minimum -= glm::vec3(baked.maxRadius);
+    baked.maximum += glm::vec3(baked.maxRadius);
+    return baked;
+}
+BufferPointCloud::BufferPointCloud(std::vector<PointVertex> points)
+    : BufferPointCloud(bake(std::move(points)))
+{
+}
+BufferPointCloud::BufferPointCloud(Baked&& baked)
+    : points(std::move(baked.points)), minimum(baked.minimum), maximum(baked.maximum),
+      maxRadius(baked.maxRadius)
+{
+}
 Geometry BoxGeometry(float w, float h, float d)
 {
     require(w > 0 && h > 0 && d > 0, "Invalid box size");
@@ -267,6 +303,13 @@ uint32_t Scene::add(Geometry geometry, const MeshStandardMaterial& material, glm
     nodes.back().material = material;
     return id;
 }
+uint32_t Scene::addPoints(PointCloud cloud, glm::mat4 local, uint32_t parent)
+{
+    require(bool(cloud), "Invalid point cloud");
+    auto id = addGroup(local, parent);
+    nodes.back().cloud = std::move(cloud);
+    return id;
+}
 Object3D& Scene::get(uint32_t id)
 {
     auto it = std::lower_bound(nodes.begin(), nodes.end(), id,
@@ -287,7 +330,7 @@ void Scene::remove(uint32_t id)
 }
 SceneSnapshot Scene::snapshot(double t) const
 {
-    SceneSnapshot result{t, sun, lights, {}};
+    SceneSnapshot result{t, sun, lights, {}, {}};
     result.meshes.reserve(nodes.size());
     std::unordered_map<uint32_t, glm::mat4> transforms;
     for (auto& node : nodes)
@@ -296,6 +339,9 @@ SceneSnapshot Scene::snapshot(double t) const
         transforms.emplace(node.id(), world);
         if (node.geometry)
             result.meshes.push_back({node.id(), node.geometry, node.material, world, node.castsShadow});
+        // 点云节点与网格节点各自进入自己的列表，快照不改变两者的类型语义。
+        else if (node.cloud)
+            result.points.push_back({node.id(), node.cloud, world});
     }
     return result;
 }

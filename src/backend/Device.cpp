@@ -56,8 +56,11 @@ void Device::init(const DeviceOptions& options)
         VkPhysicalDeviceFeatures2 f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features};
         vkGetPhysicalDeviceFeatures2(gpu, &f);
         vkGetPhysicalDeviceProperties(gpu, &properties);
+        // 点云用 discard 裁出圆盘，并在同一管线里对 HDR 混合、对其余附件不混合，
+        // 因此需要着色器终止与独立混合两项特性。
         if (properties.apiVersion < VK_API_VERSION_1_3 || !features.dynamicRendering ||
-            !features12.timelineSemaphore || properties.limits.maxColorAttachments < 5)
+            !features12.timelineSemaphore || !features.shaderDemoteToHelperInvocation ||
+            !f.features.independentBlend || properties.limits.maxColorAttachments < 6)
             continue;
         vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, nullptr);
         std::vector<VkQueueFamilyProperties> families(count);
@@ -79,7 +82,8 @@ void Device::init(const DeviceOptions& options)
             break;
     }
     if (!physical)
-        throw std::runtime_error("Requires Vulkan 1.3 dynamic rendering, timeline semaphore and five MRTs");
+        throw std::runtime_error(
+            "Requires Vulkan 1.3 dynamic rendering, timeline semaphore, independent blend and six MRTs");
     float priority = 1;
     VkDeviceQueueCreateInfo qc{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qc.queueFamilyIndex = family;
@@ -89,7 +93,11 @@ void Device::init(const DeviceOptions& options)
     f12.timelineSemaphore = VK_TRUE;
     VkPhysicalDeviceVulkan13Features f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12};
     f.dynamicRendering = VK_TRUE;
-    VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f};
+    f.shaderDemoteToHelperInvocation = VK_TRUE;
+    // independentBlend 属于核心特性，单独挂一层 Features2。
+    VkPhysicalDeviceFeatures2 core{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f};
+    core.features.independentBlend = VK_TRUE;
+    VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &core};
     dc.queueCreateInfoCount = 1;
     dc.pQueueCreateInfos = &qc;
     const char* swap = VK_KHR_SWAPCHAIN_EXTENSION_NAME;

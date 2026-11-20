@@ -22,8 +22,8 @@ VkShaderModule loadModule(Device& d, const std::filesystem::path& path, Lifetime
     return shader;
 }
 VkPipeline graphicsPipeline(Device& d, Lifetime& life, const std::filesystem::path& dir, const char* vs,
-                            const char* fs, VkPipelineLayout layout, std::span<const VkFormat> colors, bool depth,
-                            bool shadow)
+                            const char* fs, VkPipelineLayout layout, std::span<const VkFormat> colors,
+                            const GraphicsOptions& options)
 {
     Lifetime temporary;
     VkPipelineShaderStageCreateInfo stages[2]{};
@@ -40,7 +40,7 @@ VkPipeline graphicsPipeline(Device& d, Lifetime& life, const std::filesystem::pa
         {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
         {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, uv)}};
     VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    if (depth)
+    if (options.vertexInput)
     {
         vertex.vertexBindingDescriptionCount = 1;
         vertex.pVertexBindingDescriptions = &binding;
@@ -54,17 +54,32 @@ VkPipeline graphicsPipeline(Device& d, Lifetime& life, const std::filesystem::pa
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     raster.lineWidth = 1;
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    raster.depthBiasEnable = shadow;
+    // 保持与既有渲染一致的"不剔除"：示例资产含单面几何，剔除会改变参考画面。
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.depthBiasEnable = options.depthBias;
     raster.depthBiasConstantFactor = 1.25f;
     raster.depthBiasSlopeFactor = 1.6f;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPipelineDepthStencilStateCreateInfo z{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    z.depthTestEnable = z.depthWriteEnable = depth;
-    z.depthCompareOp = VK_COMPARE_OP_LESS;
+    z.depthTestEnable = options.depthTest;
+    z.depthWriteEnable = options.depthWrite;
+    z.depthCompareOp = options.depthCompare;
     std::vector<VkPipelineColorBlendAttachmentState> masks(colors.size());
     for (auto& m : masks)
         m.colorWriteMask = 15;
+    if (options.blendIndex >= 0 && size_t(options.blendIndex) < masks.size())
+    {
+        // 预乘 alpha：点云按覆盖度叠加到已光照的颜色上，边缘平滑过渡。
+        auto& m = masks[size_t(options.blendIndex)];
+        m.blendEnable = VK_TRUE;
+        m.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        m.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        m.colorBlendOp = VK_BLEND_OP_ADD;
+        m.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        m.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        m.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     blend.attachmentCount = uint32_t(masks.size());
     blend.pAttachments = masks.data();
@@ -75,7 +90,7 @@ VkPipeline graphicsPipeline(Device& d, Lifetime& life, const std::filesystem::pa
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     rendering.colorAttachmentCount = uint32_t(colors.size());
     rendering.pColorAttachmentFormats = colors.data();
-    rendering.depthAttachmentFormat = depth ? depthFormat : VK_FORMAT_UNDEFINED;
+    rendering.depthAttachmentFormat = options.depthTest ? depthFormat : VK_FORMAT_UNDEFINED;
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
     ci.stageCount = fs ? 2 : 1;
     ci.pStages = stages;
@@ -121,6 +136,16 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
     lighting = setLayout(7, false);
     resolve = setLayout(4, false);
     colorSet = setLayout(1, false);
+    {
+        // 点云实例缓冲：只读存储缓冲，顶点与片元都要读。
+        VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                                             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        ci.bindingCount = 1;
+        ci.pBindings = &binding;
+        check(vkCreateDescriptorSetLayout(d.device, &ci, nullptr, &points), "descriptor layout");
+        life.release.push_back([this] { vkDestroyDescriptorSetLayout(d.device, points, nullptr); });
+    }
     auto layout = [&](VkDescriptorSetLayout second)
     {
         VkDescriptorSetLayout sets[] = {frame, second};
@@ -139,15 +164,39 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
     lightLayout = layout(lighting);
     resolveLayout = layout(resolve);
     colorLayout = layout(colorSet);
-    shadow = graphicsPipeline(d, life, dir, "shadow.vert", nullptr, meshLayout, {}, true, true);
-    geometry = graphicsPipeline(d, life, dir, "geometry.vert", "geometry.frag", meshLayout, gFormats, true, false);
+    pointsLayout = layout(points);
+    GraphicsOptions mesh;
+    GraphicsOptions zOnly;
+    zOnly.depthBias = true;
+    GraphicsOptions fullscreen;
+    fullscreen.vertexInput = false;
+    fullscreen.depthTest = fullscreen.depthWrite = false;
+    GraphicsOptions splatState;
+    splatState.vertexInput = false;
+    // 点云与网格互相遮挡依赖同一张深度图：点在后被网格挡住，点在前覆盖网格，
+    // 因此比较用 LESS_OR_EQUAL 并在通过时写深度。
+    splatState.depthCompare = VK_COMPARE_OP_LESS_OR_EQUAL;
+    splatState.blendIndex = 5;
+    shadow = graphicsPipeline(d, life, dir, "shadow.vert", nullptr, meshLayout, {}, zOnly);
+    geometry = graphicsPipeline(d, life, dir, "geometry.vert", "geometry.frag", meshLayout, gFormats, mesh);
     shade = graphicsPipeline(d, life, dir, "fullscreen.vert", "lighting.frag", lightLayout, std::array{hdrFormat},
-                             false, false);
+                             fullscreen);
     temporal =
         graphicsPipeline(d, life, dir, "fullscreen.vert", "temporal.frag", resolveLayout, std::array{hdrFormat},
-                         false, false);
+                         fullscreen);
     color = graphicsPipeline(d, life, dir, "fullscreen.vert", "color.frag", colorLayout, std::array{colorFormat},
-                             false, false);
+                             fullscreen);
+    // 点云写 HDR 与全部 G-buffer：深度、ID、米制深度与速度必须与网格一致，
+    // 否则同一像素的几何真值与颜色会分属不同物体。
+    const std::array<VkFormat, 6> splatFormats{colorFormat, hdrFormat, hdrFormat, VK_FORMAT_R32_SFLOAT,
+                                               VK_FORMAT_R32_UINT, hdrFormat};
+    splat = graphicsPipeline(d, life, dir, "points.vert", "points.frag", pointsLayout, splatFormats, splatState);
+    // 几何真值 pass 没有 HDR 附件：同一份点云只重画 G-buffer 与深度。
+    GraphicsOptions splatDepthState;
+    splatDepthState.vertexInput = false;
+    splatDepthState.depthCompare = VK_COMPARE_OP_LESS_OR_EQUAL;
+    splatDepth = graphicsPipeline(d, life, dir, "points.vert", "points.depth.frag", pointsLayout,
+                                 std::span<const VkFormat>(splatFormats).first(5), splatDepthState);
     auto sampler = [&](VkFilter filter, VkSamplerAddressMode mode)
     {
         VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -218,20 +267,25 @@ void viewport(VkCommandBuffer cmd, int x, int y, uint32_t w, uint32_t h)
     vkCmdSetViewport(cmd, 0, 1, &v);
     vkCmdSetScissor(cmd, 0, 1, &s);
 }
-void beginPass(VkCommandBuffer cmd, std::span<Image* const> colors, Image* depth)
+void beginPass(VkCommandBuffer cmd, std::span<Image* const> colors, Image* depth, bool load)
 {
-    auto attach = [](Image* img, bool z)
+    // 附件描述按上限静态分配：点云的六附件 pass 与网格的五附件 pass 共用这条入口，
+    // 超出上限说明调用方声明了设备根本不允许的帧，直接拒绝而不是写坏栈。
+    if (colors.size() > maxColorAttachments)
+        throw std::invalid_argument("Too many color attachments");
+    auto attach = [load](Image* img, bool z)
     {
         VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         a.imageView = img->view;
         a.imageLayout = img->layout;
-        a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        // 保留模式用于在已有结果上叠加：点云必须在网格光照之上混合，且沿用已写入的深度。
+        a.loadOp = load ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
         a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        if (z)
+        if (z && !load)
             a.clearValue.depthStencil.depth = 1;
         return a;
     };
-    std::array<VkRenderingAttachmentInfo, 5> attachments{};
+    std::array<VkRenderingAttachmentInfo, maxColorAttachments> attachments{};
     for (size_t i = 0; i < colors.size(); ++i)
         attachments[i] = attach(colors[i], false);
     VkRenderingAttachmentInfo z{};

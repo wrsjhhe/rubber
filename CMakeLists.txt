@@ -15,12 +15,24 @@ FetchContent_Declare(stb URL https://codeload.github.com/nothings/stb/zip/f05691
 set(GLM_BUILD_LIBRARY OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glm stb)
 set(shader_outputs)
-foreach(shader geometry.vert geometry.frag shadow.vert fullscreen.vert lighting.frag temporal.frag color.frag)
+foreach(shader geometry.vert geometry.frag shadow.vert fullscreen.vert lighting.frag temporal.frag color.frag points.vert)
   set(output "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader}.spv")
   add_custom_command(OUTPUT "${output}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
     COMMAND Vulkan::glslc --target-env=vulkan1.3 -O "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}" -o "${output}"
     DEPENDS "shaders/${shader}" shaders/frame.glsl VERBATIM)
+  list(APPEND shader_outputs "${output}")
+endforeach()
+# 点云片元着色器编译两遍：颜色通道额外输出 HDR，几何真值通道没有 HDR 附件。
+foreach(variant "points;1" "points.depth;0")
+  list(GET variant 0 name)
+  list(GET variant 1 define)
+  set(output "${CMAKE_CURRENT_BINARY_DIR}/shaders/${name}.frag.spv")
+  add_custom_command(OUTPUT "${output}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
+    COMMAND Vulkan::glslc --target-env=vulkan1.3 -O -DPOINTS_HDR=${define}
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/points.frag" -o "${output}"
+    DEPENDS shaders/points.frag shaders/frame.glsl VERBATIM)
   list(APPEND shader_outputs "${output}")
 endforeach()
 add_custom_target(renderer_shaders DEPENDS ${shader_outputs})
@@ -29,6 +41,8 @@ add_library(renderer
   src/render/Pipeline.cpp src/render/RenderScene.cpp src/render/graph/FrameGraph.cpp
   src/render/passes/ShadowPass.cpp src/render/passes/GeometryPass.cpp src/render/passes/LightingPass.cpp
   src/render/passes/TemporalPass.cpp src/render/passes/ColorPass.cpp src/render/passes/ReadbackPass.cpp
+  src/render/passes/PointsPass.cpp
+  src/modules/mesh/MeshModule.cpp src/modules/points/PointsModule.cpp src/modules/points/RenderPoints.cpp
   src/render/Renderer.cpp)
 add_dependencies(renderer renderer_shaders)
 target_include_directories(renderer PUBLIC include PRIVATE "${stb_SOURCE_DIR}" third_party/cgltf)
@@ -51,6 +65,9 @@ if(BUILD_TESTING)
   add_executable(pass_check tests/pass_check.cpp)
   target_link_libraries(pass_check PRIVATE renderer)
   add_test(NAME pass_check COMMAND pass_check)
+  add_executable(points_check tests/points_check.cpp)
+  target_link_libraries(points_check PRIVATE renderer)
+  add_test(NAME points_check COMMAND points_check)
   add_executable(graph_check tests/graph_check.cpp)
   target_link_libraries(graph_check PRIVATE renderer)
   target_include_directories(graph_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
