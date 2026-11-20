@@ -215,6 +215,9 @@ struct View::Impl
     unsigned historyNumber = 0;
     double time = 0;
     bool hasReadback = false, lastTaa = false;
+    // 上一帧是否被判为静止（相机与所有模块的输入都与上一帧相同）。静止判定只在颜色帧上
+    // 有意义，几何真值请求不改变历史基准，也不会把这里置真。
+    bool stationary = false;
     unsigned historySlot() const
     {
         return historyNumber % 2;
@@ -547,6 +550,10 @@ uint32_t View::visiblePoints() const
 {
     return impl->pointCount;
 }
+bool View::stationary() const
+{
+    return impl->stationary;
+}
 Frame View::read() const
 {
     auto& v = *impl;
@@ -598,7 +605,11 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     v.beginTransients();
 
     Globals f{};
-    f.vp = camera.projection(v.w, v.h) * camera.view();
+    const auto projection = camera.projection(v.w, v.h);
+    f.vp = projection * camera.view();
+    // 点尺寸用纯投影矩阵换算内参：投影的两轴尺度乘上各轴分辨率即为像素焦距，
+    // 与视图旋转无关，也不会把 y 向下的负号带进半径。
+    f.lens = {std::abs(projection[0][0]) * .5f * float(v.w), std::abs(projection[1][1]) * .5f * float(v.h), 0, 0};
     f.oldVP = v.lastVP;
     f.invVP = glm::inverse(f.vp);
     f.eye = {camera.position, 1};
@@ -848,6 +859,7 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
         ++v.historyNumber;
     }
     v.hasReadback = o.readback;
+    v.stationary = color && stationary;
     v.visibleCount = v.stats.visibleMeshes;
     v.pointCount = v.stats.visiblePoints;
     ++v.number;

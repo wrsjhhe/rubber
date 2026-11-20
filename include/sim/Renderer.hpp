@@ -57,6 +57,9 @@ class View
     uint32_t visibleMeshes() const;
     // 本帧提交绘制的点数；点云不在 CPU 侧剔除，因此等于快照中的点数。
     uint32_t visiblePoints() const;
+    // 上一帧是否被判为静止：相机、光照与所有模块的输入都与上一帧相同，历史被冻结复用。
+    // 只在颜色帧上为真；几何真值交付不改变颜色历史基准。
+    bool stationary() const;
     // 上一帧帧图实际执行的 pass 清单（按执行顺序），用于确认按需裁剪。
     const std::vector<std::string>& activePasses() const;
 

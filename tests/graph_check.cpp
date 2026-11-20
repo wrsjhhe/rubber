@@ -595,6 +595,53 @@ try
                 covered += barrier.range.size;
         expect(covered == 64, "Buffer export did not hand over every byte written this frame");
     }
+    // 颜色附件的读改写：以 LOAD 进入或做混合时，旧附件值也是这次访问的输入。
+    // 只声明 WRITE 会让依赖图有边而屏障没把先前写入变成可见，因此目标访问必须含读与写。
+    {
+        FrameGraph graph;
+        auto hdr = graph.createImage("hdr", color());
+        auto a = graph.reserve("lighting"), b = graph.reserve("splat");
+        graph.addPass(a, [&](FrameGraph::Declaration& d) { d.write(hdr, Access::ColorWrite); },
+                      [](VkCommandBuffer) {});
+        graph.addPass(b, [&](FrameGraph::Declaration& d) { d.readWrite(hdr, Access::ColorWrite); },
+                      [](VkCommandBuffer) {});
+        graph.exportImage(hdr, Layout::ShaderRead);
+        graph.compile();
+        expect(graph.activePasses() == std::vector<std::string>{"lighting", "splat"},
+               "Read-write pass was culled");
+        const CompiledPass* write = nullptr;
+        const CompiledPass* readWrite = nullptr;
+        for (auto& pass : graph.passes())
+        {
+            if (pass.name == "lighting")
+                write = &pass;
+            if (pass.name == "splat")
+                readWrite = &pass;
+        }
+        expect(write && readWrite, "Read-write graph lost a pass");
+        auto readWriteBarrier = [&]
+        {
+            for (auto& barrier : readWrite->barriers)
+                if (barrier.image && barrier.resource == hdr.index)
+                    return &barrier;
+            return static_cast<const Barrier*>(nullptr);
+        }();
+        expect(readWriteBarrier != nullptr, "Read-write of an initialized attachment produced no barrier");
+        expect(readWriteBarrier->to == Layout::ColorAttachment, "Read-write changed the attachment layout");
+        expect((readWriteBarrier->dstAccess & VK_ACCESS_COLOR_ATTACHMENT_READ_BIT) != 0,
+               "Read-write barrier did not make the previous attachment value visible to reads");
+        expect((readWriteBarrier->dstAccess & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) != 0,
+               "Read-write barrier lost the attachment write access");
+        expect(readWriteBarrier->dstStage == VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+               "Read-write barrier targeted the wrong stage");
+        expect((readWriteBarrier->srcAccess & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) != 0,
+               "Read-write barrier did not wait for the previous writer");
+        // 覆盖写不消费旧值：它的目标访问只应有写，不需要额外等待附件读取。
+        for (auto& barrier : write->barriers)
+            if (barrier.image && barrier.resource == hdr.index)
+                expect((barrier.dstAccess & VK_ACCESS_COLOR_ATTACHMENT_READ_BIT) == 0,
+                       "A plain attachment write asked for read access it never uses");
+    }
     std::cout << "PASS: frame graph culling, diagnostics, subresources and import/export\n";
     return 0;
 }

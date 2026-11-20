@@ -1,7 +1,10 @@
 // 点云模块验证：与网格共用同一张深度、强度与半径原样保留、双相机下前后遮挡互换、
 // 深度与实例标签语义确定，并确认点云以普通模块接入调度（pass 清单只多不少）。
+// 另覆盖点尺寸只依赖纯投影（俯仰/翻滚/双轴内参）与静止收敛后点云变化使 TAA 历史失效。
 #include "sim/Renderer.hpp"
+#include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -33,6 +36,52 @@ float luminance(const Frame& frame, uint32_t index)
 uint32_t labelledPixels(const Frame& frame, uint32_t label)
 {
     return uint32_t(std::count(frame.ids.begin(), frame.ids.end(), label));
+}
+// 标签像素的包围盒：用于确认点足迹的宽高比，而不是只比面积。
+struct Footprint
+{
+    uint32_t left = 0, right = 0, top = 0, bottom = 0, width = 0, height = 0;
+};
+Footprint footprint(const Frame& frame, uint32_t label)
+{
+    Footprint box;
+    bool any = false;
+    box.left = frame.width;
+    box.top = frame.height;
+    for (uint32_t y = 0; y < frame.height; ++y)
+        for (uint32_t x = 0; x < frame.width; ++x)
+            if (frame.ids[size_t(y) * frame.width + x] == label)
+            {
+                any = true;
+                box.left = std::min(box.left, x);
+                box.right = std::max(box.right, x);
+                box.top = std::min(box.top, y);
+                box.bottom = std::max(box.bottom, y);
+            }
+    if (!any)
+        return {};
+    box.width = box.right - box.left + 1;
+    box.height = box.bottom - box.top + 1;
+    return box;
+}
+// 红减蓝：点用高饱和红，天空偏蓝，这个差值能稳定区分"点在不在"。
+float redness(const Frame& frame, uint32_t index)
+{
+    auto* p = frame.rgba.data() + size_t(index) * 4;
+    return float(p[0]) - float(p[2]);
+}
+// 窗口内最红的像素：点移动后的位置允许几个像素的取整误差。
+float brightestRedNear(const Frame& frame, uint32_t x, uint32_t y, uint32_t radius)
+{
+    float best = -255;
+    for (uint32_t row = y - std::min(y, radius); row <= std::min(frame.height - 1, y + radius); ++row)
+        for (uint32_t column = x - std::min(x, radius); column <= std::min(frame.width - 1, x + radius); ++column)
+            best = std::max(best, redness(frame, row * frame.width + column));
+    return best;
+}
+bool closeEnough(float actual, float expected, float tolerance)
+{
+    return std::abs(actual - expected) <= tolerance * std::max(actual, expected);
 }
 // 单点云：一份共享资产同时被多个视图使用，测试据此确认它没有逐视图状态。
 PointCloud onePoint(glm::vec3 position, float radius, float intensity, glm::vec3 color = glm::vec3(0.25f))
@@ -168,6 +217,147 @@ try
     auto narrowFrame = renderReadback(renderer, narrow.snapshot(8), towardOrigin, *narrowView, flat);
     expect(labelledPixels(narrowFrame, labelOf(1)) * 4 < labelledPixels(dimFrame, labelOf(1)),
            "Radius did not change the footprint");
+
+    // 点尺寸只由纯投影决定：同一距离下俯仰与翻滚都不该改变覆盖面积。
+    // 用 vp 的元素当焦距会把这些姿态混进半径，俯仰 45 度面积减半、翻滚 60 度再减半。
+    Scene poseScene;
+    auto poseNode = poseScene.addPoints(onePoint({0, 0, 0}, 0.5f, 1.0f));
+    auto poseSnapshot = poseScene.snapshot(9);
+    PerspectiveCamera straight;
+    straight.position = {0, 0, 5};
+    straight.verticalFov = 60;
+    PerspectiveCamera pitched = straight;
+    auto pitch = glm::radians(45.f);
+    pitched.position = {0, 5 * std::sin(pitch), 5 * std::cos(pitch)};
+    PerspectiveCamera rolled = straight;
+    auto roll = glm::radians(60.f);
+    rolled.up = {std::sin(roll), std::cos(roll), 0};
+    auto poseView = renderer.createView(96, 72, 64);
+    auto straightFrame = renderReadback(renderer, poseSnapshot, straight, *poseView, flat);
+    auto pitchView = renderer.createView(96, 72, 64);
+    auto pitchedFrame = renderReadback(renderer, poseSnapshot, pitched, *pitchView, flat);
+    auto rollView = renderer.createView(96, 72, 64);
+    auto rolledFrame = renderReadback(renderer, poseSnapshot, rolled, *rollView, flat);
+    auto straightArea = float(labelledPixels(straightFrame, labelOf(poseNode)));
+    expect(straightArea > 20, "Reference point was too small to measure");
+    expect(closeEnough(float(labelledPixels(pitchedFrame, labelOf(poseNode))), straightArea, .1f),
+           "Pitch changed the point size");
+    expect(closeEnough(float(labelledPixels(rolledFrame, labelOf(poseNode))), straightArea, .1f),
+           "Roll changed the point size");
+
+    // 两轴内参不同时，足迹必须是椭圆而不是正方形：分别换算 x/y 焦距才谈得上标定相机。
+    PerspectiveCamera calibrated;
+    calibrated.position = {0, 0, 5};
+    calibrated.fx = 240;
+    calibrated.fy = 160;
+    calibrated.cx = 64;
+    calibrated.cy = 48;
+    auto calibratedView = renderer.createView(128, 96, 64);
+    auto calibratedFrame = renderReadback(renderer, poseSnapshot, calibrated, *calibratedView, flat);
+    auto box = footprint(calibratedFrame, labelOf(poseNode));
+    expect(box.width > 0 && box.height > 0, "Calibrated camera lost the point");
+    expect(float(box.width) > float(box.height) * 1.3f, "Point footprint ignored the per-axis focal lengths");
+
+    // 静止收敛后点云变化必须让 TAA 历史失效：静止分支按像素平均历史，不看运动匹配，
+    // 光把 Motion 写零并不能阻止旧点云被一直复用。点用高饱和红，背景是偏蓝的天空，
+    // 因此"红减蓝"能稳定区分点在不在，而不受天空梯度影响。
+    auto signalPoint = [](float intensity)
+    {
+        return onePoint({0, 0, 0}, 0.5f, intensity, {1.f, .1f, .1f});
+    };
+    Scene still;
+    auto stillNode = still.addPoints(signalPoint(4));
+    auto stillA = still.snapshot(10);
+    PerspectiveCamera staticCamera;
+    staticCamera.position = {0, 0, 5};
+    auto historyView = renderer.createView(64, 48, 64);
+    Frame converged;
+    for (int i = 0; i < 18; ++i)
+        converged = renderReadback(renderer, stillA, staticCamera, *historyView);
+    expect(historyView->stationary(), "Static point cloud never converged");
+    auto referenceRed = redness(converged, centerIndex(converged));
+    auto referenceBright = luminance(converged, centerIndex(converged));
+    auto backdropRed = redness(converged, 4 + 4 * converged.width);
+    expect(referenceRed > backdropRed + 40, "Point did not stand out from the background");
+
+    // 移动：中心必须回落到背景，新位置必须出现点。
+    still.get(stillNode).local = glm::translate(glm::mat4(1), {2, 0, 0});
+    auto stillB = still.snapshot(11);
+    auto afterMove = renderReadback(renderer, stillB, staticCamera, *historyView);
+    expect(!historyView->stationary(), "Moved point cloud was treated as stationary");
+    expect(redness(afterMove, centerIndex(afterMove)) < backdropRed + 20,
+           "TAA kept the old point after it moved");
+    expect(brightestRedNear(afterMove, afterMove.width / 2 + 21, afterMove.height / 2, 4) >
+               referenceRed * .8f,
+           "TAA lost the point at its new position");
+
+    // 删除：整体移除后旧画面不能留在历史里。
+    still.remove(stillNode);
+    auto stillC = still.snapshot(12);
+    auto afterDelete = renderReadback(renderer, stillC, staticCamera, *historyView);
+    expect(!historyView->stationary(), "Removed point cloud was treated as stationary");
+    expect(redness(afterDelete, centerIndex(afterDelete)) < backdropRed + 20,
+           "TAA kept a deleted point cloud");
+
+    // 两台相机各有自己的历史基准：A 先看到变化不能让 B 误判为静止，否则 B 会一直显示旧点云。
+    Scene pairScene;
+    auto pairNode = pairScene.addPoints(signalPoint(4));
+    auto pairA = pairScene.snapshot(20);
+    auto left = renderer.createView(64, 48, 64);
+    auto right = renderer.createView(64, 48, 64);
+    for (int i = 0; i < 18; ++i)
+        renderReadback(renderer, pairA, staticCamera, *left);
+    for (int i = 0; i < 18; ++i)
+        renderReadback(renderer, pairA, staticCamera, *right);
+    expect(left->stationary() && right->stationary(), "Two-camera convergence failed");
+    auto shared = renderReadback(renderer, pairA, staticCamera, *left);
+    auto sharedBright = luminance(shared, centerIndex(shared));
+    pairScene.get(pairNode).local = glm::translate(glm::mat4(1), {2, 0, 0});
+    auto pairB = pairScene.snapshot(21);
+    renderReadback(renderer, pairB, staticCamera, *left);
+    auto rightFrame = renderReadback(renderer, pairB, staticCamera, *right);
+    expect(!right->stationary(), "Second camera reused the first camera's history baseline");
+    expect(redness(rightFrame, centerIndex(rightFrame)) < backdropRed + 20,
+           "Second camera kept the stale point");
+
+    // 强度变化也是内容变化：静止分支会一直保持旧亮度，必须重新解析。
+    pairScene.get(pairNode).local = glm::mat4(1);
+    pairScene.get(pairNode).cloud = signalPoint(1);
+    auto pairC = pairScene.snapshot(22);
+    auto dimmer = renderReadback(renderer, pairC, staticCamera, *right);
+    expect(!right->stationary(), "Changed point intensity was treated as stationary");
+    expect(luminance(dimmer, centerIndex(dimmer)) < sharedBright * .85f,
+           "TAA kept the old intensity after the asset changed");
+
+    // 换色：颜色与强度同在一份共享缓冲里，静止历史同样必须失效。
+    pairScene.get(pairNode).cloud = onePoint({0, 0, 0}, 0.5f, 4.0f, {.1f, 1.f, .1f});
+    auto pairD = pairScene.snapshot(23);
+    auto recolored = renderReadback(renderer, pairD, staticCamera, *right);
+    expect(!right->stationary(), "Changed point colour was treated as stationary");
+    auto* pixel = recolored.rgba.data() + size_t(centerIndex(recolored)) * 4;
+    expect(pixel[1] > pixel[0] + 40, "TAA kept the old colour after the asset changed");
+
+    // 几何真值交付不推进颜色历史基准：几何帧里点云已变化时，下一帧颜色仍须刷新。
+    Scene geometryOnly;
+    auto geometryNode = geometryOnly.addPoints(signalPoint(4));
+    auto geometryA = geometryOnly.snapshot(30);
+    auto geometryView = renderer.createView(64, 48, 64);
+    Frame geometryConverged;
+    for (int i = 0; i < 18; ++i)
+        geometryConverged = renderReadback(renderer, geometryA, staticCamera, *geometryView);
+    auto geometryRed = redness(geometryConverged, centerIndex(geometryConverged));
+    geometryOnly.get(geometryNode).local = glm::translate(glm::mat4(1), {2, 0, 0});
+    auto geometryB = geometryOnly.snapshot(31);
+    auto only = renderer.submit(
+        {geometryB, staticCamera, *geometryView, {{Channel::InstanceId, Delivery::Cpu}}});
+    expect(only.status == SubmitStatus::Submitted, "Geometry-only submit was rejected");
+    only.frame->read(Channel::InstanceId);
+    only.frame.reset();
+    auto refreshed = renderReadback(renderer, geometryB, staticCamera, *geometryView);
+    expect(!geometryView->stationary(), "Geometry-only frame advanced the color history baseline");
+    expect(redness(refreshed, centerIndex(refreshed)) < backdropRed + 20,
+           "Color history survived a geometry-only frame");
+    expect(geometryRed > backdropRed + 40, "Geometry-only reference frame was invalid");
 
     std::cout << "PASS: point clouds share the mesh depth buffer and keep intensity and radius\n";
     return 0;

@@ -17,30 +17,44 @@ struct StageAccess
 constexpr VkPipelineStageFlags shaderStages =
     VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-StageAccess stageAccess(Access access)
+// 读改写的访问掩码必须同时含读与写：颜色附件以 LOAD 进入、混合需要旧值，
+// 只声明 WRITE 会让依赖图有边而屏障实际没把先前写入对附件读取变得可见。
+StageAccess stageAccess(Access access, bool readsBack = false)
 {
+    StageAccess result;
     switch (access)
     {
     case Access::Sampled:
-        return {VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_ACCESS_SHADER_READ_BIT};
+        result = {VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_SHADER_READ_BIT};
+        break;
     case Access::UniformRead:
-        return {shaderStages, VK_ACCESS_UNIFORM_READ_BIT};
+        result = {shaderStages, VK_ACCESS_UNIFORM_READ_BIT};
+        break;
     case Access::StorageRead:
-        return {shaderStages, VK_ACCESS_SHADER_READ_BIT};
+        result = {shaderStages, VK_ACCESS_SHADER_READ_BIT};
+        break;
     case Access::ColorWrite:
-        return {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+        result = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+        break;
     case Access::DepthWrite:
-        return {VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT};
+        result = {VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT};
+        break;
     case Access::CopySource:
-        return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+        result = {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+        break;
     case Access::CopyDestination:
-        return {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+        result = {VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+        break;
     case Access::HostRead:
-        return {VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT};
+        result = {VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT};
+        break;
     }
-    return {};
+    // 深度读改写已隐含读；颜色附件只有写，需要显式补上读。传输目标不做读改写。
+    if (readsBack && access == Access::ColorWrite)
+        result.access |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+    return result;
 }
 Layout layoutOf(Access access)
 {
@@ -690,7 +704,7 @@ void FrameGraph::plan(const std::vector<uint32_t>& seq)
         for (auto& use : nodes[pass].uses)
         {
             auto target = layoutOf(use.access);
-            auto stage = stageAccess(use.access);
+            auto stage = stageAccess(use.access, use.readsBack);
             if (use.image)
             {
                 auto& image = images[use.resource];

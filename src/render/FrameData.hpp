@@ -16,8 +16,11 @@ struct Globals
 {
     glm::mat4 vp, oldVP, invVP, lightVP[4];
     glm::vec4 eye, sunDirection, sunColor, splits, jitter, settings, pointPosition[16], pointColor[16], info;
+    // 纯投影的两轴焦距（像素单位）。vp 含视图旋转，用它的元素当焦距会让点尺寸随俯仰/翻滚变化，
+    // 因此单独传递内参：x、y 各一个尺度，fx != fy 的标定相机也能正确换算出椭圆足迹。
+    glm::vec4 lens;
 };
-static_assert(sizeof(Globals) == 1072);
+static_assert(sizeof(Globals) == 1088);
 struct Draw
 {
     uint32_t object;

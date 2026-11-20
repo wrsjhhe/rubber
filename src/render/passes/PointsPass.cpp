@@ -17,7 +17,9 @@ void recordSplat(VkCommandBuffer cmd, const Pipelines& pipe, VkDescriptorSet fra
         attachments[colors++] = hdr;
     // 保留已有内容：网格的光照结果与深度都要继续参与比较与混合。
     beginPass(cmd, std::span<Image* const>(attachments.data(), colors), &depth, true);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, stable ? pipe.splatDepth : pipe.splat);
+    // 管线按附件数量选，而不是按"是否真值 pass"：几何真值交付（无颜色请求）同样只有
+    // 五个 G-buffer 附件，用六附件管线会与 colorAttachmentCount 不符。
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, hdr ? pipe.splat : pipe.splatDepth);
     VkDescriptorSet sets[] = {frame, points};
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe.pointsLayout, 0, 2, sets, 0, nullptr);
     Draw push{0, 0, stable ? 1 : 0};
