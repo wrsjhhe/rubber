@@ -1,5 +1,19 @@
 # M2 独立审核
 
+## 最终复审：278371f（2026-11-20）
+
+结论：**M2 在当前约定范围内通过验收**。R-M2-001 及其包围盒补充关闭；R-M2-002/003/004 保持已关闭。本节取代下方历史结论。
+
+核对代码：minimum/maximum 已是 const，构造通过 bake 完成校验与边界计算，再初始化不可变成员。编译期检查使用未加括号的成员访问 decltype，得到成员声明类型，确实可检查成员自身是否 const。几何边界可写入口已封闭，未发现本次变更新增的阻塞问题。
+
+独立验证：build-dev Release 构建成功，四项 CTest 全通过；sensor_check、temporal_check、request_check、asset_check 分别 --validation 成功；Gallery smoke 成功。独立 capture 到 build-dev/review-m2.png，与 example/preview/courtyard.png 的 SHA256 均为 3C748469DA2744211A0931F476B88C79662CA528386AD35468608B42F7F921C9。TAA 误差保持静止 28.623/6.28194、运动 347.217/293.259。
+
+验证边界：新增部分可见网格测试请求 MetricDepth，只直接验证几何剔除，不单独验证阴影范围；阴影路径通过代码核对及整体 Gallery 捕获回归覆盖。未独立复做开发者的缺陷注入。未配置 debug messenger，validation 仅记录控制台未见错误，不宣称完整消息捕获。性能、跨设备、上传限流及同代际资产驱逐仍属后续工作。
+
+可以进入 M3 帧图开发。本次仅更新审核文档，未修改产品代码。
+
+---
+
 ## 复审：8c35d79（2026-11-20）
 
 已阅读 REVIEW_M2_RESPONSE.md 并核对代码。独立执行 Release 构建、四项 CTest、asset_check --validation、gallery --smoke --validation，全部通过；未复做本版截图比较或缺陷注入实验。
