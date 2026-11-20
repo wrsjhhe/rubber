@@ -1,5 +1,19 @@
 # 实现进度
 
+## 最新状态（2026-11-20 / M5 3924da5，待审核）
+
+**M5 已实现，待审核。** 观测与呈现从渲染核心里分出来：`include/sim/Observation.hpp` 定义标定、采样时间、通道语义与只读观测，`include/sim/Processing.hpp` 定义处理链入口，`src/sensors` 实现两者，`src/presentation` 提供调试呈现。呈现隔离的做法是把调试通道从光照里彻底移除：`lighting.frag` 只输出 Beauty，新的 `presentation.frag` 读 G-buffer（与级联视图需要的 HDR）写一张独立的 `debug` 图，窗口采样 `View::debugView()`，`Channel::Debug` 交付的是同一张图。因此同一帧既能看到真实颜色，也能看到调试通道，HDR 与时序历史里只有 Beauty。
+
+观测侧：`SensorCalibration::of` 从相机得到 fx/fy/cx/cy 与近远平面，`projection()` 反算出的矩阵与 `PerspectiveCamera::projection` 一致（同一套内参写入 P00/P11/P20/P21），`Globals::lens` 用的也是这组焦距；`SampleTime` 的采样时刻必须等于快照时间，曝光时长作为元数据保留（曝光积分属 F12）。`Renderer::observe()` 与 `submit()` 是同一次提交，额外返回标定、采样时间与通道语义；结果只读，未请求的通道显式报错。处理链只读观测、只写自己声明的派生输出：与任何输入通道同名、全链重名、写了未声明的名字都整体拒绝，因此"处理"在结构上不可能覆盖真值通道。
+
+顺带补上一个通道语义缺口：`Channel::Resolved` 交付时序解析后的线性颜色（Hdr 只是光照结果，不是 TAA 之后的辐亮度）。它是本帧写回的历史槽，A 分量是该帧的米制深度（时序拒绝依赖它）。TAA 质量回归因此改在 Resolved 上度量：Beauty 经过曝光与色调映射，不再是覆盖率的线性函数；调试图又不再享有 TAA 累积。
+
+本轮验证：Release 构建通过；八项 CTest 全通过（新增 `observation_check`）；七项设备测试（sensor/temporal/request/asset/pass/points/observation）各以 `--validation` 运行，均 0 条校验错误；`gallery --smoke --validation` 与 `--capture m5-capture.png --validation` 退出 0、0 条，捕获图与 `example/preview/courtyard.png` 差异仍为 37472/4096000 字节（0.915%）、`max_delta=1`，与上一轮捕获图逐字节相同；`temporal_check` 在 328 个轮廓像素上 raw=4.78522、TAA=1.23697，运动 105.933/62.5146（度量口径已换，见上）。
+
+新增用例的七处置信核对均先失败后还原：把调试重新写进 `lighting.frag` →“Debug view changed the beauty color of the same frame”；把标定主点偏移清零 →“Calibration projection differs from the renderer projection”；去掉采样时刻校验 →“Observation accepted a sample time that was never sampled”；把 `res.stable` 置假 →“TAA jitter contaminated depth”；去掉派生输出与通道的重名检查 →“Chain allowed a derived output to shadow a truth channel”；去掉"请求 Debug 必须选调试通道"的校验 →“Debug channel was accepted without a debug channel selection”；去掉 presentation 的副作用根 → gallery `--smoke --validation` 重新出现 4 条 `VUID-vkCmdDraw-None-09600`。
+
+实现过程中新用例还先暴露两个真缺陷：调试图的描述符一直绑着 HDR，但声明里只在级联通道读它，于是"只请求 Debug"的帧把光照裁掉、HDR 停在 UNDEFINED，验证层报 09600；改为总是声明该读取（声明必须覆盖描述符可访问的资源）。另一个是旧 `render()` 路径下 presentation 没有导出根而被裁掉，窗口采样的调试图从未被写入；现在选了调试通道就把该 pass 声明为副作用根，该帧必定产出调试图。
+
 ## 最新独立验收（2026-11-20 / d3c0c1f）
 
 **M4 已验收，可进入 M5。** 时序解析的编译存活状态与成功提交共同决定历史推进；网格、点云、View 使用一致的两段式历史提交，Hdr-only 补充问题关闭，M4 三项审核问题全部关闭。独立 Release、七项 CTest、六项 --validation 和 Gallery smoke 通过。详见 [最终复审](REVIEW_M4.md)。本节取代下方历史待审核/需修改结论；交接中的性能与未支持能力仍保留。
@@ -83,13 +97,13 @@ Release、四项 CTest、asset_check --validation、Gallery smoke 独立通过�
 | 功能 | 状态与位置 | 缺项/限制 |
 |---|---|---|
 | F01/F02 | 已有实现，待独立审核；Scene.hpp、src/scene、src/assets/Gltf.cpp | 静态不透明导入子集；资产版本与共享场景见下方“F02 缓存拆分”行 |
-| F03/F04 | 已有实现，待审核；Renderer.cpp、Pipeline.cpp、shaders、render/passes、temporal_check | 帧图驱动的七类 pass；动态效果失效协议未实现；光照仍单次直射+点光，无阴影滤波选择 |
-| F05/F06 | 已有实现，待审核；Output.hpp、Renderer.hpp、VulkanInterop.hpp、request_check | 三份结果上限，导出复制，同 View 串行；旧 API 仍为最近帧 |
+| F03/F04 | 已有实现，待审核；Renderer.cpp、Pipeline.cpp、shaders、render/passes、temporal_check | 帧图驱动的七类 pass；动态效果失效协议未实现；光照仍单次直射+点光，无阴影滤波选择。`Hdr` 是光照结果，`Resolved` 才是时序解析后的线性颜色（A 分量带该帧米制深度） |
+| F05/F06 | 已有实现，待审核；Output.hpp、Renderer.hpp、VulkanInterop.hpp、request_check | 三份结果上限，导出复制，同 View 串行；旧 API 仍为最近帧。通道共十个，新增 `Resolved`（解析后线性颜色）与 `Debug`（调试图） |
 | F05 几何路径 | 已有实现，待审核；submit/renderFrame | 跳过光照/TAA，新 View 不建颜色历史；仍写五个 G-buffer，用过颜色的 View 保留颜色资源 |
 | F02 缓存拆分 | 已验收（278371f）；render/RenderScene.hpp、render/RenderScene.cpp、assets/AssetCache.hpp、backend/Device.hpp、tests/asset_check.cpp | 场景准备仍在调用线程录制；实例缓冲按快照版本重新分配，未跨版本复用；上传批未限流 |
 | F07 帧图 | 已有实现，待审核；render/graph/FrameGraph.hpp、FrameGraph.cpp、tests/graph_check.cpp | 单队列顺序执行；保守屏障（每 pass 保守 stage/access，不做合并优化）；瞬时资源按描述缓存复用，未做显存别名。`readWrite` 的附件屏障按读改写补 `COLOR_ATTACHMENT_READ`，由 graph_check 断言；`executed(PassHandle)` 暴露编译后的裁剪结果，供调度侧判断跨帧副作用是否真的发生 |
 | F08 模块与点云 | 已有实现，待审核；render/Module.hpp、modules/mesh、modules/points、shaders/points.vert、shaders/points.frag、render/passes/PointsPass.cpp、tests/points_check.cpp | 点云不在 CPU 侧剔除，也不参与阴影投射；无逐点历史，运动向量写零（运动分支不复用旧像素），静止冻结靠每视图的颜色历史基线失效；点云仍需按节点逐点展开到一份共享缓冲，总量受 `maxStorageBufferRange` 限制，上传批暂存未主动回收；gallery 示例场景尚未加入点云。颜色历史基线（网格姿态与点云身份）只经 `ModuleView::commitHistory(true)` 推进，未写入历史的帧（仅 Hdr、几何真值）不改变基线 |
-| F09 | 部分实现 | 已有内参、时间、真值输出和互操作头；无独立 Observation/sensors/presentation |
+| F09 观测与呈现 | 已有实现，待审核；include/sim/Observation.hpp、include/sim/Processing.hpp、src/sensors、src/presentation、shaders/presentation.frag、tests/observation_check.cpp | 标定与投影一致、采样时刻等于快照时间、通道语义表与十个通道一一对应；调试图写独立图像，Beauty/HDR 不受影响；处理链只读观测、只写自己声明的派生输出。曝光时长只是元数据（F12 才积分曝光），无畸变/噪声/运动模糊阶段，处理链只在 CPU 侧按通道字节工作，未接入 GPU 阶段 |
 | F10 | 待开发 | 无 install/export/find_package 验证 |
 | F11—F17 | 未实现 | 后续规划，不列为已支持 |
 
@@ -103,12 +117,14 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 | M2 | M1；已验收（278371f） | RenderScene、共享静态实例数据、不可变资产版本、上传依赖、延迟回收 | asset_check：同快照两相机准备与上传各一次、旧快照在原对象被修改后与清缓存后仍重现原画面、身份不复用、静止收敛后换贴图的 Color 更新、上传批与暂存回落、旧代际最终回收、渲染输入只读的编译期断言 |
 | M3 | M2；已验收（715233d） | 帧图及六类独立 pass，资源声明与分配分离 | graph_check：裁剪、未初始化读取（图像与缓冲逐区间，含"局部写+整体覆写"合并路径）、同 pass 读写冲突、循环依赖、子资源精确展开、缓冲分段导出与生产者、跨子资源/跨区间 RAW/WAR/WAW、分段读后覆写的每段屏障源状态、usage 诊断、导出终态；pass_check：按输出通道断言活跃 pass 清单（含首帧历史清除与状态变化后的重建）；六项 CTest 与五项 --validation |
 | M4 | M3；已验收（d3c0c1f） | 网格模块迁移、模块协议、点云 | points_check：同一快照两台相机下点在前/网格在前的遮挡互换、米制深度与实例标签取值、仅点云场景、点云 pass 相对网格 pass 的插入位置、强度→亮度与半径→覆盖互不影响、覆盖面积随分辨率平方增长；相同距离下俯仰/翻滚不改变覆盖、`fx != fy` 时足迹为椭圆；静止收敛后移动/删除/改强度的 Color 刷新、两相机各自的历史基线、几何真值交付不推进颜色基线；Hdr-only（关闭 TAA，时序解析被裁掉）不推进颜色历史与阈值基线、连续穿插 Hdr-only 不扰动颜色链路、网格移动 + Hdr-only 后颜色帧仍刷新。graph_check：读改写附件的 dstAccess 含读与写、普通覆盖写不含读。七项 CTest 与六项 --validation |
-| M5 | M4；待开发 | Observation、处理链入口、呈现隔离、互操作边界 | Beauty+调试同帧不串色；校准/时间一致；真值独立；无需实现全部 F11—F13 即可验收框架 |
+| M5 | M4；已有实现，待审核 | Observation、处理链入口、呈现隔离、互操作边界 | observation_check：标定反算的投影与渲染器一致（内参与视场角两条路径）、采样时刻必须等于快照时间（错时刻与负曝光被拒）、曝光区间作为元数据保留；同一帧 `{Color, Hdr, Debug}` 的 Beauty 与 HDR 逐字节等于不带调试的对照帧，调试图与 Beauty 不同且背景为零；只请求 Debug/Color 与级联通道同样不污染 Beauty，未选调试通道时请求 Debug 显式报错；Debug 的 GPU 交付与 `View::debugView()` 可用；曝光×4 + 调试通道 + TAA 抖动下米制深度与实例标签逐字节不变，而颜色改变；处理链的派生输出按输入通道计算、源观测真值不变，与通道同名/写未声明名字都被拒绝。pass_check：Resolved 交付的活跃清单、Debug 请求新增 presentation 且稳定几何副本进入清单、重复调试帧不再清除历史。八项 CTest 与七项 --validation |
 | M6 | M5；待开发 | 安装头文件/库/shader、导出 target/依赖 | 新安装前缀的外部项目 find_package 构建并离屏运行，不访问原源码/构建目录；关闭 example 可构建 |
 
 每项保留现有回归。F11—F17 分别立项，先补规格和质量/性能门槛。
 
 ## 已有验证与缺口
+
+本轮（M5）：Release 构建成功；八项 CTest 全通过（新增 observation_check）；七项设备测试各以 `--validation` 运行均 0 条；gallery `--smoke --validation`（含调试通道切换与纹理重绑）与 `--capture m5-capture.png --validation` 退出 0、0 条；捕获图与 `example/preview/courtyard.png` 差异 37472/4096000（0.915%）、`max_delta=1`，且与上一轮 `m4history-capture.png` 逐字节相同，说明呈现隔离没有改动网格路径的画面。temporal_check 的度量改为 Resolved（线性），只统计 328 个轮廓像素：raw=4.78522、TAA=1.23697，运动 105.933/62.5146；旧口径（诊断通道的 sRGB 值）随调试呈现独立而失效。七处缺陷注入均先失败后还原，其中"去掉 presentation 副作用根"由 gallery 冒烟的 4 条 `VUID-vkCmdDraw-None-09600` 捕获。新用例首次执行还暴露出两处真缺陷（描述符绑定 HDR 但未声明读取导致 09600、旧 render 路径下调试图被裁），已修复。
 
 本轮（M4 历史提交条件修复）：Release 构建成功；七项 CTest 全通过；六项 `--validation` 各 0 条；`gallery --capture m4history-capture.png --validation` 与 `--smoke --validation` 退出 0、0 条，参考图差异仍为 37472/4096000（0.915%）、`max_delta=1`；`temporal_check` 数值逐位不变。新增用例覆盖 Hdr-only（关闭 TAA 使时序解析被裁掉）不推进历史基线、连续穿插 Hdr-only 不扰动颜色链路、网格移动 + Hdr-only 后颜色帧仍刷新，三处缺陷注入（`resolved` 退回 `color`、`MeshView` 与 `PointsView` 恢复按 `res.color` 提交）均先失败后还原。
 
@@ -128,7 +144,50 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 
 尚缺显存分配自动统计证据、多队列/异步计算路径、显存别名复用，以及安装测试。点云已由 points_check 覆盖单点数据、双相机遮挡、仅点云场景、两种分辨率、强度/半径语义、相机姿态与双轴内参下的足迹、静止收敛后移动/删除/改强度与几何真值帧的颜色刷新，以及 Hdr-only 与穿插 Hdr-only 帧的历史提交条件；尚未覆盖大规模点云、逐点运动、阴影投射与上传批暂存回收。活跃 pass 清单已由 pass_check 按输出通道逐项断言，但只覆盖本仓库现存的通道组合，未覆盖全部请求×交付×选项组合。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。
 
+M5 新增缺项：处理链只有 CPU 侧按通道字节实现的 `SensorStage`，尚未接入 GPU pass，"阶段"与帧图资源没有绑定关系；`SampleTime::duration` 只是元数据，曝光积分、运动模糊与卷帘快门都未实现，因此 `end()` 与 `time()` 的差在下游还没有可观察效果。`SensorCalibration` 只描述针孔投影与近远平面，没有畸变系数、主点单位以外的像素宽高比、也没有与真实传感器模型对齐的量化/噪声项。`Channel::Resolved` 的 A 分量是本帧米制深度，`Channel::Hdr` 的 A 分量是覆盖率，两者语义不同但都编码在 alpha 里，尚未在类型上区分；调试通道只覆盖 12 个组合（三档调试通道 × 是否级联 × 是否 TAA，实际断言 4 条主路径），宽高比非 1 的窗口与超宽视野下的调试图未单独验证。呈现隔离只对 Color/HDR/Debug 三条输出证明互不覆盖，`Resolved` 与 `Debug` 同时请求时的活跃清单由 pass_check 覆盖，但"同帧同时读 Resolved 与 Debug 且带 TAA"未加断言。观测结果与处理链都按值拷贝通道字节，大分辨率下的额外拷贝开销未测量。
+
 ## 交接记录
+
+### M5 / F09 观测、处理链入口与呈现隔离
+
+任务编号 / 功能编号：M5 / F09（依赖 F05 交付、F07 帧图、F08 模块协议）
+负责人 / 日期 / 状态：开发者 / 2026-11-20 / 待审核
+代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支 3924da5（接 fa62f82）
+修改文件 / 接口变化：
+- 新增 `include/sim/Observation.hpp`、`src/sensors/Observation.cpp`：`SensorCalibration`（`of()`/`projection()`/`==`）、`SampleTime{time,duration,end()}`、`ChannelSemantic`、只读 `Observation`、`ObservationResult`；`projection()` 与 `PerspectiveCamera::projection` 走同一构造路径，主点写入 P20/P21
+- 新增 `include/sim/Processing.hpp`、`src/sensors/Processing.cpp`：`DerivedDesc`/`DerivedOutput`、`DerivedSink::{input,write}`、`SensorStage::{name,outputs,process}`、`ProcessedObservation{source,derived,find()}`、`ProcessingChain::{add,run,size,name}`
+- 新增 `src/presentation/Presentation.hpp/.cpp`、`shaders/presentation.frag`：`recordPresentation(cmd, pipe, frame, inputs, target)`；着色器按 `frame.settings.w` 选通道，读 normal/metric/id 与 HDR，背景为零，统一 sRGB 编码
+- `include/sim/Output.hpp`：`Channel` 尾部新增 `Resolved`（时序解析后的线性颜色，A 分量是该帧米制深度）与 `Debug`（调试呈现图）
+- `include/sim/Renderer.hpp`：`#include "Observation.hpp"`、`<optional>`；`RenderRequest::sampleTime`；`Renderer::observe()`；`View::debugView()/width()/height()`
+- `src/render/Renderer.cpp`：新增 `debug` 图与 `debugSet`（绑定 g[1]/g[3]/g[4]/hdr）、`ensureDebug()`、`source(Channel)` 支持 `Resolved`/`Debug`、`resolvedSlot`；`submit()` 校验 `debugChannel ∈ [0,4]` 与"请求 Debug 必须选调试通道"；`renderFrame()` 声明 `presentation` pass（总是读 HDR、`sideEffect()` 为根）并 `restoreImage(debugImage, ShaderRead)`
+- `src/render/Pipeline.hpp/.cpp`：新增 `presentationSet/presentationLayout/presentation`（4 张输入、单颜色附件）
+- `shaders/lighting.frag`、`shaders/color.frag`：删除 `settings.w` 调试分支，光照只输出 Beauty，色调映射无条件执行
+- `example/main.cpp`：窗口采样随 `debugChannel` 在 `colorView()`/`debugView()` 间重绑；冒烟第 3/5 帧切到 `debugChannel=3` 再切回 0
+- `tests/observation_check.cpp`（新增第 8 项 CTest）、`tests/pass_check.cpp`、`tests/temporal_check.cpp`、`CMakeLists.txt`
+已完成：
+- 同帧 Beauty 与调试图互不串色：`{Color, Hdr, Debug}` 请求下的 Beauty 与 HDR 逐字节等于不带调试的对照帧，调试图不同且背景为零；调试通道 2/4 也不污染 Beauty
+- 标定与出图同源：两条标定路径（内参与垂直视场角）反算的投影与 `PerspectiveCamera::projection` 逐元素一致，含 `fx=90/fy=120/cx=52/cy=30` 的非对称主点
+- 采样时刻受类型约束：`sampleTime.time != snapshot.time` 与负 `duration` 都拒绝；曝光区间 `end()` 保留为元数据
+- 真值独立：曝光×4 + 调试通道 + TAA 抖动下，米制深度与实例标签逐字节不变而颜色改变；`res.stable` 保持为"只有取像素中心几何"时为真
+- 处理链不可覆盖真值：派生输出按输入通道计算且源观测不变；与输入通道同名（`"Derived output cannot shadow input channel"`）、写未声明名字（`"Stage wrote an undeclared output"`）、全链重名都在执行前整体拒绝
+- 呈现链路在帧图上可见：pass_check 断言 `Resolved` 的活跃清单为 `{shadow,geometry,lighting,temporal}`，Debug 请求首帧为 `{history.clear,shadow,geometry,lighting,temporal,geometry.stable,color,presentation}`，重复帧去掉 `history.clear`
+仍缺项：
+- 处理链只有 CPU 侧按通道字节的实现，未接入 GPU pass；无畸变、曝光积分、运动模糊、噪声阶段
+- `SampleTime::duration` 只是元数据，`end()` 与 `time()` 的差在下游没有可观察效果（曝光积分属 F12）
+- `SensorCalibration` 只有针孔投影与近远平面，无畸变系数与噪声模型
+- `Resolved` 的 A 是米制深度、`Hdr` 的 A 是覆盖率，语义不同但都编码在 alpha，未在类型上区分
+- 调试通道只覆盖 4 条主路径（1/2/3/4 与是否级联、是否 TAA 的部分组合），宽高比非 1 的窗口与超宽视野未单独验证
+- 沿用上一轮：点云上传在图外、暂存未回收、无逐点速度与阴影投射；单队列顺序执行、屏障保守、瞬时资源无显存别名；gallery 示例场景未加入点云
+环境 / 精确构建测试命令：Windows、Visual Studio 2022 x64、Vulkan SDK 1.4.357.0、RTX 3080 Ti
+- `cmake --build build-dev --config Release`
+- `ctest --test-dir build-dev -C Release --output-on-failure`
+- `sensor_check|temporal_check|request_check|asset_check|pass_check|points_check|observation_check --validation`
+- `gallery --capture build-dev/m5-capture.png --validation`；`gallery --smoke --validation`
+结果 / 日志截图位置：八项 CTest 全通过；七项 `--validation` 与 gallery 均 0 条校验错误；捕获图与参考图差异 37472/4096000（0.915%）、`max_delta=1`，与 `m4history-capture.png` 逐字节相同；`temporal_check` 在 328 个轮廓像素上 raw=4.78522、TAA=1.23697，运动 105.933/62.5146（度量口径已换）
+缺陷注入核对：七处均先失败后还原——调试重新写进 `lighting.frag` → “Debug view changed the beauty color of the same frame”；标定主点偏移清零 → “Calibration projection differs from the renderer projection”；去掉采样时刻校验 → “Observation accepted a sample time that was never sampled”；`res.stable` 置假 → “TAA jitter contaminated depth”；去掉派生输出与通道的重名检查 → “Chain allowed a derived output to shadow a truth channel”；去掉“请求 Debug 必须选调试通道”校验 → “Debug channel was accepted without a debug channel selection”；去掉 presentation 的副作用根 → gallery `--smoke --validation` 重新出现 4 条 `VUID-vkCmdDraw-None-09600`
+性能和画质对比：未做性能测量；每帧在请求调试通道时多一个全屏 pass 与一张同尺寸 RGBA8 图像，不请求时零开销；`Resolved` 复用颜色历史槽的同一张图，不增加分配。捕获图与上一轮逐字节相同，说明网格与点云路径画面未被呈现隔离改动
+已知问题 / 下一步：等待审核；通过后进入 M6（安装头文件/库/shader、导出 target 与依赖）
+审核人 / 审核版本 / 结论 / 问题编号：待填
 
 ### M4 修复 2 / F07+F08（回应 R-M4-002 补充：Hdr-only 推进未写入的颜色历史）
 

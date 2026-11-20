@@ -17,13 +17,15 @@ C++20、Vulkan 1.3、动态渲染；当前需要至少五个颜色附件及带�
 | MetricDepth | R32F，光轴正距离，非欧氏距离；背景为零 |
 | InstanceId | R32_UINT，稳定非零标签，背景零；禁止线性插值。点云占用最高位（见下） |
 | HardwareDepth | D32F，不能当米制深度 |
-| Hdr | RGBA16F，当前为光照结果，不是时序解析后颜色 |
+| Hdr | RGBA16F，光照结果，未经时序解析 |
+| Resolved | RGBA16F，时序解析后的线性颜色（TAA 之后的辐亮度），未经曝光与色调映射；A 分量是该帧米制深度，不表示透明度 |
+| Debug | RGBA8，调试呈现图，由独立的 presentation 生成；背景为零，内容由 `debugChannel` 决定 |
 
-OutputInfo 给出尺寸、格式、行字节数。新增点云/高斯输出须显式声明深度和覆盖语义。
+OutputInfo 给出尺寸、格式、行字节数。新增点云/高斯输出须显式声明深度和覆盖语义。`Hdr` 与 `Resolved` 的区别是硬约束：需要线性图像的下游（例如传感器曝光与噪声模型）必须取 `Resolved`，取 `Hdr` 会跳过 TAA 累积；两者的 alpha 语义也不同（`Hdr` 是覆盖率，`Resolved` 是米制深度）。通道语义表 `ChannelSemantic`（`include/sim/Observation.hpp`，实现在 `src/sensors/Observation.cpp`）把 channel、名字、格式、单位、定义、背景值、是否最近点采样、是否真值一并固定下来；真值通道只描述场景本身，不随曝光、抖动或调试呈现改变。
 
 ## 渲染与时序
 
-目标路径为 Shadow → Geometry → Lighting → TemporalResolve → ColorTransform。当前已按此拆分：`geometry` 写五个 G-buffer 与硬件深度，`shadow` 写 CSM 深度图，`lighting` 写 HDR，`temporal` 读 HDR/速度/米制深度与旧历史、写本帧历史槽并输出线性颜色+深度，`color` 做曝光、色调映射与 sRGB 编码，`readback` 复制真值，历史失效时另有 `history.clear`。GGX 金属粗糙度模型；底色纹理解码 sRGB，法线/金属粗糙度按线性数据。四级 CSM 使用 texel 对齐和比较滤波，阴影剔除按光源视锥。
+目标路径为 Shadow → Geometry → Lighting → TemporalResolve → ColorTransform，调试呈现是与 ColorTransform 并列的旁路而不是它之后的阶段。当前已按此拆分：`geometry` 写五个 G-buffer 与硬件深度，`shadow` 写 CSM 深度图，`lighting` 写 HDR，`temporal` 读 HDR/速度/米制深度与旧历史、写本帧历史槽并输出线性颜色+深度，`color` 做曝光、色调映射与 sRGB 编码，`presentation` 读 G-buffer（以及级联视图需要的 HDR）写独立的调试图，`readback` 复制真值，历史失效时另有 `history.clear`。GGX 金属粗糙度模型；底色纹理解码 sRGB，法线/金属粗糙度按线性数据。四级 CSM 使用 texel 对齐和比较滤波，阴影剔除按光源视锥。
 
 颜色允许抖动，几何真值按固定像素中心采样；当前必要时额外绘制稳定几何 pass。TAA 静止积累 16 个 Halton 样本，运动采用速度重投影和深度拒绝。静止冻结只适用于所有贡献均不随时间变化的场景，雨雪等必须声明动态失效。
 
@@ -62,7 +64,24 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 
 模块协议（`src/render/Module.hpp`）：`RenderModule` 每 Renderer 一份，负责跨相机共享的准备与缓存，`prepare()` 把共享数据交给 `FrameLifetime` 保活并登记上传时间线值；`ModuleView` 每相机一份，只保存与该相机有关的状态，`declare()` 声明本模块 pass 并记录待提交的历史状态，`declareLate()` 在时序解析与颜色变换之后补声明几何真值写回，`commitHistory(bool resolved)` 在时序解析确认执行并成功提交后才落库历史基线（默认空实现，模块按需覆写）。`FrameResources` 按语义交出帧级共享资源（G-buffer、深度、HDR、显示图、历史槽、常量缓冲），模块不接触视图私有字段；`FrameStats` 由模块写入、调度侧只汇总。设备因此要求 `shaderDemoteToHelperInvocation`（点云用 `discard` 裁圆盘）、`independentBlend`（同一管线 6 个附件只有 HDR 混合）与 `maxColorAttachments >= 6`。
 
-Observation 携带通道、校准、采样时间、曝光区间、种子和深度定义。传感器处理生成新输出，不覆盖真值；Presentation 生成调试颜色，不覆盖 Beauty/HDR。
+## 观测与标定
+
+观测不是"另存一份像素"，而是把已提交的结果和它所属的那次采样绑在一起：`Renderer::observe()` 与 `submit()` 走同一条提交路径，额外返回 `SensorCalibration`、`SampleTime` 与 `std::vector<OutputInfo>`，构造 `Observation` 时校验 `sampleTime.time == FrameResult::time()`，失败即抛 "Sample time does not match the frame"。这样"结果属于哪一刻"由类型保证，而不是靠调用方记得对齐。
+
+- 标定与出图同源：`SensorCalibration::of(camera, width, height)` 在有内参时取 `camera.fx/fy/cx/cy`，否则由垂直视场角按方形像素换算；`projection()` 复用与 `PerspectiveCamera::projection` 完全相同的构造路径——`glm::perspectiveRH_ZO` 给出 P00/P11 后乘以 y 轴翻转，再把内参重写入 P00/P11/P20/P21（`2fx/w`、`-2fy/h`、`1-2cx/w`、`1-2cy/h`）。`Globals::lens` 里的焦距也取自同一组参数。三者同源是"标定可用于反投影"的前提；写成两份就会随改动漂移。
+- 采样时间是元数据，不是积分器：`SampleTime{time, duration}` 的 `time` 必须等于快照时间，`duration` 是曝光时长（0 表示瞬时），`end() = time + duration` 供下游描述曝光区间。当前渲染器按瞬时采样出图，曝光积分属 F12，因此 `duration` 只影响观测元数据，不影响像素。
+- 观测只读且不可覆盖真值：`read(Channel)` 与 `FrameResult::read` 同语义，未请求的通道显式报错而不补零；`semantic(Channel)` 给出该通道的单位、定义与背景值，供下游判断自己拿到的是什么。
+
+## 呈现隔离与处理链
+
+调试通道原来是 `lighting.frag` 里的分支，写回同一张颜色图。这样做有两个后果：一是调试帧的 Beauty 就被覆盖了，同一帧不可能既看到颜色又看到诊断；二是 HDR 与 TAA 历史会跟着调试内容走。M5 把这条分支整体删除：
+
+- `lighting.frag` 只输出 Beauty，`color.frag` 无条件做曝光+ACES+sRGB 编码，因此 `Hdr`/`Resolved`/`Color` 三条输出与是否选了调试通道无关。
+- `presentation.frag` 读 G-buffer（`normalTex`、`metricTex`、`idTex`）与 HDR（级联分区要看光照结果才能画分区色），按 `frame.settings.w` 选通道，写自己的 `debug` 图；背景为 0，最后统一做 sRGB 编码。
+- `recordPresentation()` 只提交一个全屏三角形，`View::debugView()` 与 `Channel::Debug` 暴露的是同一张图。窗口要显示诊断就采这份图，而不是把调试写进 Beauty。
+- 帧图侧有两个必须写对的细节。其一，**声明必须覆盖描述符可访问的资源**：`debugSet` 在创建时就绑定了 HDR，即使当前调试通道不读它，着色器也可以读到，因此 `presentation` pass 总是声明 `read(hdrImage)`——否则"只请求 Debug"的帧会把光照裁掉、HDR 停在 UNDEFINED，验证层报 `VUID-vkCmdDraw-None-09600`。其二，`presentation` 不是导出根（`Color` 才是），在旧 `render()` 路径下没有导出根时会被裁掉，窗口采样的调试图从未被写入；所以选了调试通道就把该 pass 声明为 `sideEffect()` 根，保证这一帧必定产出调试图。这两条都不是"多写一行保险"，而是描述符绑定与裁剪根语义的直接推论。
+- 处理链是"只能新增"的协议：`SensorStage::outputs()` 声明本阶段新增的派生输出，`SensorStage::process(DerivedSink&)` 只通过 `sink.input()` 读观测、`sink.write(name)` 取自己声明的输出，`write()` 对未声明的名字直接抛 "Stage wrote an undeclared output"。`ProcessingChain::run` 在执行任何阶段之前做全链校验：空名、零尺寸、`desc.name == Observation::semantic(channel).name`（会遮蔽输入通道）、全链重名，任一命中就整体拒绝，不留半成品输出。因此"处理器覆盖真值"在结构上不可能发生，不需要靠约定或代码评审守。`ProcessedObservation` 同时持有源观测和派生输出，调用方读派生数据时源结果仍然有效。
+- 未实现的阶段（畸变、曝光积分、运动模糊、噪声）按同一协议接入，不改变上述约束；它们目前都是缺项，不列为已支持。
 
 ## 验证与性能
 

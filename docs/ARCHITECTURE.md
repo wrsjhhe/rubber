@@ -20,7 +20,7 @@
 | src/presentation | 调试输出、显示转换 | 改写其他消费者的颜色 |
 | example | GLFW/ImGui 应用和资产 | 成为核心库必需依赖 |
 
-无需提前创建空目录。Scene 的 mesh 专用字段通过兼容适配逐步迁移；点云不能被要求伪装成三角网格。截至 M4，`src/render/graph`、`src/render/passes` 与 `src/modules` 已按表中职责存在：帧图只做声明、裁剪、依赖与屏障推导，不接触材质或点云语义；每个 pass 只录制自己的绘制，不隐式转换未声明的资源；`src/modules/mesh` 与 `src/modules/points` 是并列注册的模块，主调度只遍历 `RenderModule`/`ModuleView` 接口，没有类型分支。`src/sensors`、`src/presentation` 仍未实现。
+无需提前创建空目录。Scene 的 mesh 专用字段通过兼容适配逐步迁移；点云不能被要求伪装成三角网格。截至 M5，`src/render/graph`、`src/render/passes`、`src/modules`、`src/sensors` 与 `src/presentation` 都已按表中职责存在：帧图只做声明、裁剪、依赖与屏障推导，不接触材质或点云语义；每个 pass 只录制自己的绘制，不隐式转换未声明的资源；`src/modules/mesh` 与 `src/modules/points` 是并列注册的模块，主调度只遍历 `RenderModule`/`ModuleView` 接口，没有类型分支；`src/sensors` 只产出标定、采样语义与处理链结果，观测对象对 `FrameResult` 只读、处理链只能新增派生输出，两者都无法改写真值；`src/presentation` 只写自己的调试图像，与 Beauty/HDR 是并列的消费者而不是覆盖者。三个方向都不允许反向依赖：`src/render` 不因调试呈现改变光照输出，`src/sensors` 不进入录制路径。
 
 ## 所有权
 
@@ -30,13 +30,16 @@
 - View 持有分辨率、相机相关状态、历史注册表和失效版本。
 - FrameContext 持有当次帧槽、命令和临时资源，安全完成后回收。
 - FrameResult 持有当次输出、完成信号和元数据，不被下一帧覆盖。
-- Observation 持有观测结果及校准/采样语义。
+- Observation 持有观测结果及校准/采样语义；构造时校验采样时刻与结果帧时间一致，之后只读。
+- ProcessingChain 持有阶段与全链声明，`run()` 产出派生输出并同时保活源观测；它不持有任何可写入口通向真值通道。
 
 设备必须活得比所有依赖它的资源更久，异常路径也遵守同步与销毁顺序。
 
 ## 数据流
 
-应用 → 快照 → RenderScene/模块准备 → RenderRequest + View → FrameGraph → Vulkan 提交 → FrameResult → Sensor 或 Presentation。
+应用 → 快照 → RenderScene/模块准备 → RenderRequest + View → FrameGraph → Vulkan 提交 → FrameResult → Observation → Sensor 处理链或 Presentation。
+
+两条下游是并列的、互不覆盖的消费者：观测包一层只读元数据交给处理链，处理链只能新增派生输出；呈现从同一份 G-buffer 另出一张调试图。帧图里 Beauty 的链路（`lighting` → `temporal` → `color`）不读调试通道，调试链路（`presentation`）不写 `color` 的附件。
 
 上层使用下层接口，backend 不反向依赖具体模块。模块通过上下文声明资源/pass，不访问 Renderer::Impl 私有字段。历史作为持久导入，结果作为导出。
 
