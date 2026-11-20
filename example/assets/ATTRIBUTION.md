@@ -1,0 +1,1 @@
+Antique Camera © 2018 UX3D，作者 Maximillan Kamps。模型按 [CC0](https://creativecommons.org/publicdomain/zero/1.0/) 发布。三脚架上的 UX3D 标志仍适用[标志说明](https://github.com/KhronosGroup/glTF-Sample-Assets/blob/main/LICENSES/LicenseRef-LegalMark-UX3D.txt)。文件来自 [Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/AntiqueCamera)，未修改。
