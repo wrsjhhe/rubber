@@ -58,7 +58,8 @@ class View
     // 本帧提交绘制的点数；点云不在 CPU 侧剔除，因此等于快照中的点数。
     uint32_t visiblePoints() const;
     // 上一帧是否被判为静止：相机、光照与所有模块的输入都与上一帧相同，历史被冻结复用。
-    // 只在颜色帧上为真；几何真值交付不改变颜色历史基准。
+    // 只在真正写入颜色历史的帧上为真：几何真值交付、以及时序解析被裁掉的仅 Hdr 请求
+    // 都不会推进历史槽或各模块的历史基线，也不报静止。
     bool stationary() const;
     // 上一帧帧图实际执行的 pass 清单（按执行顺序），用于确认按需裁剪。
     const std::vector<std::string>& activePasses() const;

@@ -1,6 +1,7 @@
 // 点云模块验证：与网格共用同一张深度、强度与半径原样保留、双相机下前后遮挡互换、
 // 深度与实例标签语义确定，并确认点云以普通模块接入调度（pass 清单只多不少）。
-// 另覆盖点尺寸只依赖纯投影（俯仰/翻滚/双轴内参）与静止收敛后点云变化使 TAA 历史失效。
+// 另覆盖点尺寸只依赖纯投影（俯仰/翻滚/双轴内参）、静止收敛后点云变化使 TAA 历史失效，
+// 以及历史状态的提交条件（被裁掉时序解析的仅 Hdr 帧不推进颜色历史，网格与点云同理）。
 #include "sim/Renderer.hpp"
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
@@ -82,6 +83,10 @@ float brightestRedNear(const Frame& frame, uint32_t x, uint32_t y, uint32_t radi
 bool closeEnough(float actual, float expected, float tolerance)
 {
     return std::abs(actual - expected) <= tolerance * std::max(actual, expected);
+}
+bool hasPass(const std::vector<std::string>& passes, const char* name)
+{
+    return std::find(passes.begin(), passes.end(), name) != passes.end();
 }
 // 单点云：一份共享资产同时被多个视图使用，测试据此确认它没有逐视图状态。
 PointCloud onePoint(glm::vec3 position, float radius, float intensity, glm::vec3 color = glm::vec3(0.25f))
@@ -358,6 +363,87 @@ try
     expect(redness(refreshed, centerIndex(refreshed)) < backdropRed + 20,
            "Color history survived a geometry-only frame");
     expect(geometryRed > backdropRed + 40, "Geometry-only reference frame was invalid");
+
+    // 仅导出 Hdr 的帧同样不得推进颜色历史：它没有 color 的导出根，未启用 TAA 时也没有
+    // 副作用根，时序解析会被裁掉，颜色历史仍是旧内容。基线若提前推进，下一帧要么误判
+    // 静止而冻结旧图，要么平白丢掉已收敛的历史。
+    Scene hdrScene;
+    auto hdrNode = hdrScene.addPoints(signalPoint(4));
+    auto hdrSnapshot = hdrScene.snapshot(40);
+    auto hdrView = renderer.createView(64, 48, 64);
+    Frame hdrConverged;
+    for (int i = 0; i < 18; ++i)
+        hdrConverged = renderReadback(renderer, hdrSnapshot, staticCamera, *hdrView);
+    expect(hdrView->stationary(), "Hdr reference frame never converged");
+    auto hdrBackdrop = redness(hdrConverged, 4 + 4 * hdrConverged.width);
+    auto hdrRed = redness(hdrConverged, centerIndex(hdrConverged));
+
+    // 内容没变时只请求 Hdr：这一帧不写颜色历史，随后仍应判为静止（历史里正是这份内容）。
+    RenderOptions noTaa;
+    noTaa.taa = false;
+    auto hdrSame = renderer.submit({hdrSnapshot, staticCamera, *hdrView, {{Channel::Hdr, Delivery::Gpu}}, noTaa});
+    expect(hdrSame.status == SubmitStatus::Submitted, "Hdr-only submit was rejected");
+    expect(!hasPass(hdrView->activePasses(), "temporal"),
+           "Hdr-only frame did not prune the resolve pass, this case is not covered");
+    expect(!hdrView->stationary(), "A frame that never wrote history reported itself stationary");
+    hdrSame.frame.reset();
+    auto afterHdr = renderReadback(renderer, hdrSnapshot, staticCamera, *hdrView);
+    expect(hdrView->stationary(), "Hdr-only frame disturbed the color history");
+    expect(redness(afterHdr, centerIndex(afterHdr)) > hdrBackdrop + 40, "Resumed history lost the point");
+
+    // 内容真的变化后只请求 Hdr：历史仍是旧内容，随后的 Color 必须刷新而不能复用旧画面。
+    hdrScene.get(hdrNode).local = glm::translate(glm::mat4(1), {2, 0, 0});
+    auto hdrMoved = hdrScene.snapshot(41);
+    auto hdrOnly = renderer.submit({hdrMoved, staticCamera, *hdrView, {{Channel::Hdr, Delivery::Gpu}}, noTaa});
+    expect(hdrOnly.status == SubmitStatus::Submitted, "Hdr-only submit was rejected");
+    expect(!hasPass(hdrView->activePasses(), "temporal"), "Hdr-only frame ran the resolve pass");
+    hdrOnly.frame.reset();
+    auto hdrRefreshed = renderReadback(renderer, hdrMoved, staticCamera, *hdrView);
+    expect(!hdrView->stationary(), "Hdr-only frame advanced the color history baseline");
+    expect(redness(hdrRefreshed, centerIndex(hdrRefreshed)) < hdrBackdrop + 20,
+           "Color reused the history that the Hdr frame never wrote");
+    expect(brightestRedNear(hdrRefreshed, hdrRefreshed.width / 2 + 21, hdrRefreshed.height / 2, 4) > hdrRed * .8f,
+           "Color did not show the moved point");
+
+    // 连续穿插 Hdr-only 帧不该扰动颜色链路：内容与历史都没变，颜色帧仍静止、画面不变。
+    auto settledRed = redness(hdrRefreshed, centerIndex(hdrRefreshed));
+    for (int i = 0; i < 3; ++i)
+    {
+        auto extra = renderer.submit({hdrMoved, staticCamera, *hdrView, {{Channel::Hdr, Delivery::Gpu}}, noTaa});
+        expect(extra.status == SubmitStatus::Submitted, "Interleaved Hdr-only submit was rejected");
+        extra.frame.reset();
+        auto colour = renderReadback(renderer, hdrMoved, staticCamera, *hdrView);
+        expect(hdrView->stationary(), "Interleaved Hdr-only frame disturbed the color history");
+        expect(std::abs(redness(colour, centerIndex(colour)) - settledRed) < 10,
+               "Interleaved Hdr-only frame changed the colour output");
+    }
+    // 启用 TAA 的 Hdr 请求因历史写回副作用保留时序解析，此时历史确实被写入，属于正常路径。
+    auto taaHdr = renderer.submit({hdrMoved, staticCamera, *hdrView, {{Channel::Hdr, Delivery::Gpu}}});
+    expect(taaHdr.status == SubmitStatus::Submitted, "Taa Hdr-only submit was rejected");
+    expect(hasPass(hdrView->activePasses(), "temporal"), "Taa Hdr-only frame pruned the history side effect");
+    taaHdr.frame.reset();
+
+    // 网格侧同样如此：姿态基准只在真正写入颜色历史后提交，否则 Hdr 帧会让下一颜色帧
+    // 把新姿态当成"未变"而冻结旧画面。
+    Scene mover;
+    auto moverNode = mover.add(BoxGeometry(), material);
+    auto moverStill = mover.snapshot(50);
+    auto moverView = renderer.createView(64, 48, 64);
+    Frame moverConverged;
+    for (int i = 0; i < 18; ++i)
+        moverConverged = renderReadback(renderer, moverStill, staticCamera, *moverView);
+    expect(moverView->stationary(), "Mesh reference frame never converged");
+    auto meshCenter = luminance(moverConverged, centerIndex(moverConverged));
+    mover.get(moverNode).local = glm::translate(glm::mat4(1), {2, 0, 0});
+    auto moverMoved = mover.snapshot(51);
+    auto meshHdr = renderer.submit({moverMoved, staticCamera, *moverView, {{Channel::Hdr, Delivery::Gpu}}, noTaa});
+    expect(meshHdr.status == SubmitStatus::Submitted, "Mesh Hdr-only submit was rejected");
+    meshHdr.frame.reset();
+    auto movedFrame = renderReadback(renderer, moverMoved, staticCamera, *moverView);
+    expect(!moverView->stationary(), "Hdr-only frame advanced the mesh history baseline");
+    expect(movedFrame.ids[centerIndex(movedFrame)] == 0, "Mesh did not leave the centre");
+    expect(std::abs(luminance(movedFrame, centerIndex(movedFrame)) - meshCenter) > 10,
+           "TAA froze the old mesh after a Hdr-only frame");
 
     std::cout << "PASS: point clouds share the mesh depth buffer and keep intensity and radius\n";
     return 0;

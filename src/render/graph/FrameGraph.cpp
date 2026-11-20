@@ -847,8 +847,8 @@ void FrameGraph::compile()
     transient.clear();
     // 声明期状态只用于裁剪与排序，plan 会按导入声明重新推导执行期状态；
     // 因此 compile 每帧只调用一次，重建前先 reset。
-    auto live = cull();
-    auto seq = order(live);
+    livePasses = cull();
+    auto seq = order(livePasses);
     plan(seq);
     for (auto pass : seq)
         active.push_back(nodes[pass].name);
@@ -901,9 +901,14 @@ void FrameGraph::reset()
     images.clear();
     buffers.clear();
     active.clear();
+    livePasses.clear();
     compiled.clear();
     final.clear();
     transient.clear();
+}
+bool FrameGraph::executed(PassHandle handle) const
+{
+    return handle.index < livePasses.size() && livePasses[handle.index];
 }
 uint32_t FrameGraph::barrierCount() const
 {

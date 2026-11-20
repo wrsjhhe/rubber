@@ -103,6 +103,12 @@ class ModuleView
     {
         return true;
     }
+    // 提交颜色历史：只有本帧的时序解析 pass 真正执行并成功提交后才传 true。
+    // 模块在 declare 阶段只能记下"待提交"的状态，不能提前改写历史基线，否则一次被裁剪的
+    // 时序解析（例如仅导出 Hdr 且未启用 TAA）也会让基线跳到未写入的内容上。
+    virtual void commitHistory(bool)
+    {
+    }
 };
 // 当前代际的资产缓存入口：模块按身份取 GPU 资产，不持有代际的所有权。
 struct AssetProvider

@@ -25,6 +25,7 @@ class PointsView final : public ModuleView
     {
         return stationary;
     }
+    void commitHistory(bool resolved) override;
     void declare(FrameResources&, FrameStats&) override;
     void declareLate(FrameResources&, FrameStats&) override;
 
@@ -42,8 +43,19 @@ class PointsView final : public ModuleView
     // 从无到有、从有到无都必须让静止冻结失效。
     uint64_t historyVersion = 0;
     uint32_t historyCount = 0;
+    // 本帧声明的点云身份：只在时序解析真正执行后才会转成 historyVersion/historyCount。
+    uint64_t pendingVersion = 0;
+    uint32_t pendingCount = 0;
     bool stationary = true;
 };
+
+void PointsView::commitHistory(bool resolved)
+{
+    if (!resolved)
+        return;
+    historyVersion = pendingVersion;
+    historyCount = pendingCount;
+}
 
 void PointsView::declare(FrameResources& res, FrameStats& stats)
 {
@@ -52,14 +64,13 @@ void PointsView::declare(FrameResources& res, FrameStats& stats)
     stats.visiblePoints = count;
     // 静止冻结会把上一步解析结果整块留在历史里，因此点云的内容、变换、数量或有无一旦变化，
     // 就必须判定为非静止，否则收敛后的画面会继续显示旧点云（Motion 写零不足以表达，
-    // 静止分支并不做运动匹配）。只有颜色帧推进基线：几何真值交付不触碰颜色历史。
-    auto identity = count ? points->version() : 0;
-    stationary = identity == historyVersion && count == historyCount;
-    if (res.color)
-    {
-        historyVersion = identity;
-        historyCount = count;
-    }
+    // 静止分支并不做运动匹配）。
+    // 基线只能由真正写入颜色历史的帧推进：仅导出 Hdr 的请求可能裁掉时序解析，此时颜色
+    // 历史还是旧内容，提前推进基线会让下一帧误判静止并冻结旧图。因此这里只记下待提交的
+    // 身份，提交由 commitHistory 在确认时序解析执行后完成。
+    pendingVersion = count ? points->version() : 0;
+    pendingCount = count;
+    stationary = pendingVersion == historyVersion && pendingCount == historyCount;
     if (!count)
         return;
     auto& graph = *res.graph;

@@ -211,6 +211,9 @@ class FrameGraph
     {
         return active;
     }
+    // 编译后某个 pass 是否仍然存活（会被执行）。调度侧据此判断跨帧副作用（例如历史写回）
+    // 是否真的发生，而不是按"本次请求需要颜色"这类意图标志推断。
+    bool executed(PassHandle) const;
     const std::vector<CompiledPass>& passes() const
     {
         return compiled;
@@ -323,6 +326,7 @@ class FrameGraph
     std::vector<ImageResource> images;
     std::vector<BufferResource> buffers;
     std::vector<std::string> active;
+    std::vector<bool> livePasses; // 编译时的裁剪结果，按 pass 序号索引
     std::vector<CompiledPass> compiled;
     std::vector<Barrier> final;
     std::vector<Transient> transient;

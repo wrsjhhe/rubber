@@ -724,9 +724,11 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     f.info.w = stationary ? (v.stillSamples < temporalSamples ? 1.f / (v.stillSamples + 1) : 0.f) : -1.f;
     std::memcpy(v.globals->mapped, &f, sizeof(f));
 
+    // 时序解析写回历史槽：它是否真的执行由编译结果决定，是历史状态提交的唯一依据。
+    const auto temporalHandle = graph.reserve("temporal");
     if (color)
         graph.addPass(
-            graph.reserve("temporal"),
+            temporalHandle,
             [&](render::FrameGraph::Declaration& d)
             {
                 d.read(hdrImage);
@@ -803,6 +805,10 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
         for (auto handle : {hdrImage, displayImage, historyImage[0], historyImage[1]})
             graph.restoreImage(handle, Layout::ShaderRead);
     graph.compile();
+    // 只有真实写入了颜色历史的帧才能推进历史状态。"需要颜色"（res.color）不等于"时序解析
+    // 执行了"：仅导出 Hdr 的请求没有 color 的导出根，未启用 TAA 时也没有副作用根，时序解析
+    // 会被裁掉，此时颜色历史仍是上一份内容，提前推进会让下一帧误判静止并冻结旧图。
+    const bool resolved = color && graph.executed(temporalHandle);
     // 编译结果决定实际需要的瞬时资源：只分配存活的声明。
     for (auto& entry : graph.transients())
     {
@@ -844,9 +850,9 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     check(vkResetFences(v.d.device, 1, &v.fence), "reset frame fence");
     check(vkQueueSubmit(v.d.queue, 1, &si, v.fence), "submit frame");
 
-    // 历史有效性状态只在真正写入历史的帧上推进：几何真值或 GPU 交付请求没有触碰历史，
-    // 不能让下一帧误判历史已作废而重新积累。
-    if (color)
+    // 历史有效性状态只在真正写入历史的帧上推进：几何真值、仅 HDR 交付或其他被裁剪的帧
+    // 没有触碰历史，不能让下一帧误判历史已作废而重新积累，也不能让它误判为可复用。
+    if (resolved)
     {
         v.lastVP = f.vp;
         v.stillSamples = stationary ? std::min(temporalSamples, v.stillSamples + 1) : unsigned(o.taa && !accumulate);
@@ -858,8 +864,12 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
         v.time = snapshot.time;
         ++v.historyNumber;
     }
+    // 模块的颜色历史基线同样只在时序解析真正执行并成功提交后提交；
+    // 未提交的帧只是把本帧身份丢弃，不改变基线。
+    for (auto& module : v.modules)
+        module->commitHistory(resolved);
     v.hasReadback = o.readback;
-    v.stationary = color && stationary;
+    v.stationary = resolved && stationary;
     v.visibleCount = v.stats.visibleMeshes;
     v.pointCount = v.stats.visiblePoints;
     ++v.number;

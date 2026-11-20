@@ -27,6 +27,7 @@ class MeshView final : public ModuleView
     {
         return stationary;
     }
+    void commitHistory(bool resolved) override;
     void declare(FrameResources&, FrameStats&) override;
     void declareLate(FrameResources&, FrameStats&) override;
 
@@ -72,9 +73,17 @@ class MeshView final : public ModuleView
     std::array<Image*, 5> targets{};
     std::vector<uint32_t> visibleItems;
     render::PassHandle stableHandle;
-    std::unordered_map<uint32_t, MeshHistory> lastModels;
+    // lastModels 是"上一次真正写入颜色历史"的姿态基准；pendingModels 是本帧准备提交的。
+    // 两者分开保存，未写入历史的帧（例如仅导出 Hdr）不会把基准带到别的内容上。
+    std::unordered_map<uint32_t, MeshHistory> lastModels, pendingModels;
     bool stationary = true;
 };
+
+void MeshView::commitHistory(bool resolved)
+{
+    if (resolved)
+        lastModels = std::move(pendingModels);
+}
 
 void MeshView::declare(FrameResources& res, FrameStats& stats)
 {
@@ -109,7 +118,8 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
         rasterVP[j].y += globals.jitter.y * rasterVP[j].w;
     }
     visibleItems.clear();
-    std::unordered_map<uint32_t, MeshHistory> models;
+    auto& models = pendingModels;
+    models.clear();
     bool still = items.size() == lastModels.size();
     for (uint32_t i = 0; i < items.size(); ++i)
     {
@@ -130,9 +140,7 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
             visibleItems.push_back(i);
     }
     stationary = still;
-    // 只有颜色帧推进历史：几何真值或 GPU 交付帧不改变 TAA 与重投影的历史基准。
-    if (res.color)
-        lastModels = std::move(models);
+    // 姿态基准不在这里推进：只有确认时序解析写入了颜色历史，commitHistory 才会提交它。
     stats.visibleMeshes = uint32_t(visibleItems.size());
     if (res.color && options.shadows)
         fitShadows(globals, *res.camera, items, tile);
