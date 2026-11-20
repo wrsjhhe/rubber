@@ -45,7 +45,7 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 
 从请求输出、必要历史写回和副作用反向裁剪；不能误裁 GPU 输出。编译执行顺序、屏障及首末使用点。首版单队列、保守分配，别名复用和多队列后续优化。仅包装固定调用不能算完成帧图。
 
-当前实现：`src/render/graph/FrameGraph.hpp` 的声明层用 `Layout`/`Access`/`ImageUsage`/`BufferUsage` 描述意图，pass 体内不出现 `VkImageLayout`/`VkAccessFlags`；`Subresource{mip,mipCount,layer,layerCount}` 与 `BufferRange{offset,size}` 让依赖按子资源求交。跟踪粒度是逐区间的：图像按 (mip, layer) 展开成精确 cell 集（多 layer 的子范围不做首末压平），缓冲按字节段切分并只覆盖声明过的区间，每段各自记录写入者、读取者与是否已定义，因此"写了一部分就读全部"会在编译期被拒绝。一次写入会收集所有相交子资源的旧写入者与读取者，建立完整 WAW/WAR 边。声明期与执行期的缓冲状态是两张表：声明期的段可以为了压缩依赖而合并相邻同状态区间，`plan()` 则在导入声明上独立建一张覆盖 `[0,size)` 的区间表，按所有活跃访问的字节边界预切分后重放，因此一次局部写入不会改写未访问字节的已定义状态。`compile()` 依次做校验、反向裁剪（`exportImage/exportBuffer` 与 `sideEffect` 为根）、拓扑排序、屏障规划；`execute()` 才翻译成 `vkCmdPipelineBarrier` 并回写物理布局。导入声明初始布局与是否已初始化，导出声明终态布局并作为裁剪根，`restoreImage` 只回写布局、不作根，供跨帧复用的历史槽使用；导出与恢复只转换本帧被访问过的子资源，整图消费者需自行声明整图范围。`Renderer.cpp` 每帧重建声明，再按 `transients()` 分配或复用瞬时资源；槽奇偶与历史有效性只随真正写入历史的帧推进，几何真值与 GPU 交付请求不再使 TAA 历史失效。有效 pass 清单经 `View::activePasses()` 对外可见，`tests/pass_check.cpp` 按输出通道逐项断言，`tests/graph_check.cpp` 在无设备条件下覆盖裁剪、诊断与区间跟踪。
+当前实现：`src/render/graph/FrameGraph.hpp` 的声明层用 `Layout`/`Access`/`ImageUsage`/`BufferUsage` 描述意图，pass 体内不出现 `VkImageLayout`/`VkAccessFlags`；`Subresource{mip,mipCount,layer,layerCount}` 与 `BufferRange{offset,size}` 让依赖按子资源求交。跟踪粒度是逐区间的：图像按 (mip, layer) 展开成精确 cell 集（多 layer 的子范围不做首末压平），缓冲按字节段切分并只覆盖声明过的区间，每段各自记录写入者、读取者与是否已定义，因此"写了一部分就读全部"会在编译期被拒绝。一次写入会收集所有相交子资源的旧写入者与读取者，建立完整 WAW/WAR 边。声明期与执行期的缓冲状态是两张表：声明期的段可以为了压缩依赖而合并相邻同状态区间，`plan()` 则在导入声明上独立建一张覆盖 `[0,size)` 的区间表，按所有活跃访问的字节边界预切分后重放，因此一次局部写入不会改写未访问字节的已定义状态。`readWrite` 是"读改写同一资源"的独立声明：它既消费先前内容（要求已定义、保留对上一个写入者的依赖、参与 RAW 边），又不构成同一 pass 的反馈回路。附件读改写需要同时具备读与写访问——以 LOAD 进入的附件与混合操作都会读取旧值，屏障的目标访问因此是 `COLOR_ATTACHMENT_READ|COLOR_ATTACHMENT_WRITE`（深度读改写本已隐含读）；只声明写会让依赖图有边而屏障没把先前写入变成可见。`compile()` 依次做校验、反向裁剪（`exportImage/exportBuffer` 与 `sideEffect` 为根）、拓扑排序、屏障规划；`execute()` 才翻译成 `vkCmdPipelineBarrier` 并回写物理布局。导入声明初始布局与是否已初始化，导出声明终态布局并作为裁剪根，`restoreImage` 只回写布局、不作根，供跨帧复用的历史槽使用；导出与恢复只转换本帧被访问过的子资源，整图消费者需自行声明整图范围。`Renderer.cpp` 每帧重建声明，再按 `transients()` 分配或复用瞬时资源；槽奇偶与历史有效性只随真正写入历史的帧推进，几何真值与 GPU 交付请求不再使 TAA 历史失效。有效 pass 清单经 `View::activePasses()` 对外可见，`tests/pass_check.cpp` 按输出通道逐项断言，`tests/graph_check.cpp` 在无设备条件下覆盖裁剪、诊断与区间跟踪。
 
 模块负责资产准备、类型批次、可见性、资源/pass 注册、输出语义和历史失效。点云有自己的数据和绘制实现，公共调度只调用协议。
 
@@ -53,11 +53,12 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 
 点云是独立类型，不伪装成三角网格：`BufferPointCloud` 与几何一样在构造时算定点数据、包围盒与最大半径（包围盒按最大半径外扩，用于剔除），`SceneSnapshot::points` 与 `meshes` 并列，节点共用父子变换与稳定 ID。
 
-- 绘制：每点是一个正对相机的圆盘（6 顶点实例化公告板）。位置在准备阶段一次变换到世界空间，同一份数据被多个节点引用时按节点展开；半径以世界单位给出，着色器按 `focal * 0.5 / 视深 * 分辨率` 换算像素，最小 0.5 像素，因此不同分辨率与距离下保持物理尺寸。
+- 绘制：每点是一个正对相机的圆盘（6 顶点实例化公告板）。位置在准备阶段一次变换到世界空间，同一份数据被多个节点引用时按节点展开；半径以世界单位给出，着色器按 `radius * fx / 视深`、`radius * fy / 视深` 分别换算两个轴的像素半径，最小 0.5 像素，因此不同分辨率与距离下保持物理尺寸。焦距来自**纯投影矩阵**（`Globals::lens = {|P00|*width/2, |P11|*height/2}`），不能取 `vp` 的元素：`vp` 含视图旋转，俯仰或翻滚会改变该元素，半径随之漂移，90 度翻滚还会退化到最小像素；两轴分开换算也让 `fx != fy` 的标定相机得到椭圆足迹。
 - 强度与半径：强度乘在线性颜色上作为辐亮度，按覆盖度预乘 alpha 混合到已光照的 HDR；半径只决定覆盖面积，两者互不影响。
 - 遮挡：点云 pass 以保留模式进入渲染，对硬件深度做 `LESS_OR_EQUAL` 测试并回写，因此点与网格在同一张深度图上互相遮挡，顺序只由深度决定，不依赖绘制次序。
-- 深度与 ID：点写 `MetricDepth` 用与网格相同的公式（`1/gl_FragCoord.w`，光轴正距离）；`InstanceId` 的最高位置 1、低 31 位是点云节点的稳定 ID，因此消费方能在同一通道上区分网格与点云且标签不冲突；`Motion` 写零表示"无历史匹配"，时序解析不会复用旧像素，`AlbedoMetal`/`NormalRough` 与网格同义（法线朝向相机、粗糙度 1）。
-- 已知边界：不参与阴影投射与 CPU 剔除，没有逐点运动向量；大规模点云按节点整体驻留一份存储缓冲，受 `maxStorageBufferRange` 限制。
+- 深度与 ID：点写 `MetricDepth` 用与网格相同的公式（`1/gl_FragCoord.w`，光轴正距离）；`InstanceId` 的最高位置 1、低 31 位是点云节点的稳定 ID，因此消费方能在同一通道上区分网格与点云且标签不冲突；`Motion` 写零表示"无历史匹配"，运动分支不会复用旧像素，`AlbedoMetal`/`NormalRough` 与网格同义（法线朝向相机、粗糙度 1）。
+- 历史失效：静止冻结（`info.w >= 0`）按像素平均历史，不看运动匹配，因此 `Motion` 写零不足以表达"点云变了"。每个 `PointsView` 保存上次真正写入颜色历史时的点云身份与点数（共享缓冲版本号，零表示无点云），一旦移动、替换、增删、改强度或半径即返回 `unchanged() == false`，相机与网格都没变也不会进入静止分支；几何真值交付（无颜色请求）不推进这份基线。`View::stationary()` 暴露上一帧的静止判定，供集成方与测试核对。
+- 已知边界：不参与阴影投射与 CPU 剔除，没有逐点运动向量；大规模点云按节点整体驻留一份存储缓冲，受 `maxStorageBufferRange` 限制。存储缓冲以 `StorageRead` 登记进帧图（本帧读取有显式声明与屏障），但上传发生在图外，完成时序仍由时间线信号量在提交时声明；上传批的暂存副本随点云驻留，大点云尚未主动回收。
 
 模块协议（`src/render/Module.hpp`）：`RenderModule` 每 Renderer 一份，负责跨相机共享的准备与缓存，`prepare()` 把共享数据交给 `FrameLifetime` 保活并登记上传时间线值；`ModuleView` 每相机一份，只保存与该相机有关的状态，`declare()` 声明本模块 pass，`declareLate()` 在时序解析与颜色变换之后补声明几何真值写回。`FrameResources` 按语义交出帧级共享资源（G-buffer、深度、HDR、显示图、历史槽、常量缓冲），模块不接触视图私有字段；`FrameStats` 由模块写入、调度侧只汇总。设备因此要求 `shaderDemoteToHelperInvocation`（点云用 `discard` 裁圆盘）、`independentBlend`（同一管线 6 个附件只有 HDR 混合）与 `maxColorAttachments >= 6`。
 

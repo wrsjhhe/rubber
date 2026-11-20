@@ -18,7 +18,7 @@ ctest --test-dir build -C Release --output-on-failure
 - `gallery --model path/to/asset.glb` 将静态不透明 glTF 模型放到展台上，也支持含外部缓冲和图片的 .gltf。
 - `gallery --capture image.png` 无窗口渲染并导出 PNG。可与 `--model` 组合。
 - `gallery --benchmark` 实测 1、4、8 个视图的批次耗时。每轮预热后统计 120 个批次，包含快照、录制、提交及最后一批 GPU 完成等待。
-- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单，`points_check --validation` 核对点云与网格的双向遮挡及强度/半径语义。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断。validation 模式需要 SDK 验证层。
+- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单，`points_check --validation` 核对点云与网格的双向遮挡、强度/半径语义、相机姿态与双轴内参下的点尺寸，以及点云变化后 TAA 历史是否刷新。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断。validation 模式需要 SDK 验证层。
 - 仅编译引擎可传入 `-DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF`。嵌入其他程序时可用 `DeviceOptions::shaderDirectory` 指向生成的 SPIR-V 目录。当前 gallery 直接使用构建目录的着色器和源码目录的示例资产，移动可执行文件时需一并考虑这两个路径。
 - `python tools/pngdiff.py a.png b.png` 统计两张 PNG 的差异字节数、最大与平均通道差，用于核对捕获画面是否只差舍入。
 
@@ -61,13 +61,13 @@ renderer.render(snapshot, camera, *view, capture);
 auto frame = view->read();
 ```
 
-这个例子中心像素的深度为 4.5 米，实例编号为 id。深度是相机坐标系中沿光轴的正距离，背景的深度和 ID 均为零。每个 View 同时容纳一个未完成提交，可在读回前先提交其他视图。read() 等待本视图并返回 CPU 自有副本；再次提交同一视图会覆盖此前的 GPU 输出。切换相机、跳转仿真或替换场景时设置 resetHistory。用 `BufferPointCloud` 加 `scene.addPoints(cloud)` 可加入点云：点的半径按世界单位给出，它与网格共用同一张深度图与实例通道，点占据的像素标签最高位为 1、低 31 位是该节点 ID。
+这个例子中心像素的深度为 4.5 米，实例编号为 id。深度是相机坐标系中沿光轴的正距离，背景的深度和 ID 均为零。每个 View 同时容纳一个未完成提交，可在读回前先提交其他视图。read() 等待本视图并返回 CPU 自有副本；再次提交同一视图会覆盖此前的 GPU 输出。切换相机、跳转仿真或替换场景时设置 resetHistory。用 `BufferPointCloud` 加 `scene.addPoints(cloud)` 可加入点云：点的半径按世界单位给出，它与网格共用同一张深度图与实例通道，点占据的像素标签最高位为 1、低 31 位是该节点 ID。半径换算用相机纯投影的两轴焦距，俯仰或翻滚不会改变点的表观大小；点云被移动、替换、增删或改强度时，静止冻结的 TAA 历史会自动失效。
 
 几何与贴图按资产身份缓存，材质按内容缓存，贴图还区分色彩空间。资产在构造后不可变：几何顶点、索引与包围盒、贴图像素都不能原地修改，材质按值进入快照。因此修改用户手里的材质只影响之后创建的快照，已提交的快照始终能重现当初的画面（含剔除与阴影范围），切换缓存代际后也一样。`Renderer::assetStats()` 返回场景准备、复用与上传计数，可用于确认同一快照的多台相机只准备与上传一次。
 
 ## GPU 数据契约
 
-`View::imageView(Channel)` 暴露由视图持有的 VkImageView。附件在 render 提交完成后可按 SHADER_READ_ONLY_OPTIMAL 读取。外部消费者应使用相同设备，协调提交与资源生命周期。当前 Renderer 的录制、提交和缓存接口按单线程调用设计；场景快照可由调用方在仿真步边界生成后移交给渲染线程。仅由 GPU 消费时可打开 stableGeometry，获得像素中心的几何通道。TAA 与几何真值同时启用时，为保证采样位置会额外录制一次无抖动的几何 pass。`View::activePasses()` 返回上一帧实际执行的 pass 名，可用来确认裁剪结果；几何真值或 GPU 交付请求不经过颜色链路，也不会让 TAA 历史失效。
+`View::imageView(Channel)` 暴露由视图持有的 VkImageView。附件在 render 提交完成后可按 SHADER_READ_ONLY_OPTIMAL 读取。外部消费者应使用相同设备，协调提交与资源生命周期。当前 Renderer 的录制、提交和缓存接口按单线程调用设计；场景快照可由调用方在仿真步边界生成后移交给渲染线程。仅由 GPU 消费时可打开 stableGeometry，获得像素中心的几何通道。TAA 与几何真值同时启用时，为保证采样位置会额外录制一次无抖动的几何 pass。`View::activePasses()` 返回上一帧实际执行的 pass 名，可用来确认裁剪结果；`View::stationary()` 返回上一帧是否判为静止（相机、光照与所有模块输入都与上一帧相同），可据此判断渐进细化是否收敛。几何真值或 GPU 交付请求不经过颜色链路，也不会让 TAA 历史失效。
 
 | 通道 | 格式与语义 |
 |---|---|
@@ -80,7 +80,7 @@ auto frame = view->read();
 
 ## 当前边界
 
-主要验证范围为 Windows、NVIDIA RTX 3080 Ti 和不透明静态三角网格，支持实例运动。图像畸变、按曝光时间积分的运动模糊、透明材质、骨骼动画、HDRI 预滤波 IBL、DLSS 和多 GPU 尚待扩展。TAA 负责抗锯齿。glTF 导入器读取静态姿态和上述核心材质子集，贴图使用 UV0 和重复采样；暂未覆盖完整的 glTF 材质扩展与采样器语义。帧图目前单队列顺序执行、屏障偏保守、瞬时资源按描述缓存但不做显存别名，多队列与别名复用留待后续按实测优化。点云不在 CPU 侧剔除、不投射阴影，也没有逐点速度（运动向量写零，只保证不被 TAA 复用旧像素）；大规模点云按节点整体驻留一份存储缓冲，受设备的 `maxStorageBufferRange` 限制，示例展厅尚未加入点云。
+主要验证范围为 Windows、NVIDIA RTX 3080 Ti 和不透明静态三角网格，支持实例运动。图像畸变、按曝光时间积分的运动模糊、透明材质、骨骼动画、HDRI 预滤波 IBL、DLSS 和多 GPU 尚待扩展。TAA 负责抗锯齿。glTF 导入器读取静态姿态和上述核心材质子集，贴图使用 UV0 和重复采样；暂未覆盖完整的 glTF 材质扩展与采样器语义。帧图目前单队列顺序执行、屏障偏保守、瞬时资源按描述缓存但不做显存别名，多队列与别名复用留待后续按实测优化。点云不在 CPU 侧剔除、不投射阴影，也没有逐点速度（运动向量写零，只保证运动分支不复用旧像素，静止冻结另靠每视图的点云身份基线失效）；大规模点云按节点整体驻留一份存储缓冲，受设备的 `maxStorageBufferRange` 限制，上传批的暂存副本尚未主动回收，示例展厅也尚未加入点云。
 
 材质、贴图及网格在构造后即不可变，修改内容需以新对象重新发布；快照按值保存材质并持有几何与贴图的固定版本，所以旧快照不受后续修改影响。首次出现的资产在一次上传批内提交，帧提交等待该批的时间线值，不随相机数量增加重复上传；准备录制仍在调用线程完成。上传批完成后在正常准备路径回收，暂存副本随之释放，`assetStats()` 的 pendingUploads 与 stagingBytes 可观察该状态。切换大型场景后可用 clearAssetCache() 切换缓存代际，旧代际的缓冲仍被在途提交或视图引用时不会销毁，最后一个引用消失后才回收。后续可以从异步准备、上传限流、显存子分配和跨视图命令录制入手优化。
 
