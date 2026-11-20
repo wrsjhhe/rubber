@@ -15,7 +15,8 @@ FetchContent_Declare(stb URL https://codeload.github.com/nothings/stb/zip/f05691
 set(GLM_BUILD_LIBRARY OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glm stb)
 set(shader_outputs)
-foreach(shader geometry.vert geometry.frag shadow.vert fullscreen.vert lighting.frag temporal.frag color.frag points.vert)
+foreach(shader geometry.vert geometry.frag shadow.vert fullscreen.vert lighting.frag temporal.frag color.frag
+        presentation.frag points.vert)
   set(output "${CMAKE_CURRENT_BINARY_DIR}/shaders/${shader}.spv")
   add_custom_command(OUTPUT "${output}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
@@ -43,6 +44,7 @@ add_library(renderer
   src/render/passes/TemporalPass.cpp src/render/passes/ColorPass.cpp src/render/passes/ReadbackPass.cpp
   src/render/passes/PointsPass.cpp
   src/modules/mesh/MeshModule.cpp src/modules/points/PointsModule.cpp src/modules/points/RenderPoints.cpp
+  src/sensors/Observation.cpp src/sensors/Processing.cpp src/presentation/Presentation.cpp
   src/render/Renderer.cpp)
 add_dependencies(renderer renderer_shaders)
 target_include_directories(renderer PUBLIC include PRIVATE "${stb_SOURCE_DIR}" third_party/cgltf)
@@ -72,6 +74,9 @@ if(BUILD_TESTING)
   target_link_libraries(graph_check PRIVATE renderer)
   target_include_directories(graph_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
   add_test(NAME graph_check COMMAND graph_check)
+  add_executable(observation_check tests/observation_check.cpp)
+  target_link_libraries(observation_check PRIVATE renderer)
+  add_test(NAME observation_check COMMAND observation_check)
 endif()
 if(RENDERER_EXAMPLE)
   set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)

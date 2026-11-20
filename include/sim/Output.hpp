@@ -14,7 +14,14 @@ enum class Channel
     MetricDepth,
     InstanceId,
     HardwareDepth,
-    Hdr
+    Hdr,
+    // 时序解析后的线性颜色：Hdr 是光照结果，这里才是 TAA 之后的辐亮度，
+    // 未经曝光与色调映射。传感器若需要线性图像应取这个通道。
+    // A 分量是该帧的米制深度（时序拒绝依赖它），不是透明通道。
+    Resolved,
+    // 调试呈现：由独立的 presentation 生成，与 Color/Hdr 互不覆盖。
+    // 请求它必须同时用 RenderOptions::debugChannel 指定要看的通道。
+    Debug
 };
 enum class Delivery
 {

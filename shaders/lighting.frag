@@ -51,7 +51,7 @@ void main() {
     vec3 world=p.xyz/p.w;
     uint id=texture(idTex,uv).r;
     if(id==0) {
-        outputColor=vec4(frame.settings.w==0 ? sky(normalize(world-frame.eye.xyz)):vec3(0),1);
+        outputColor=vec4(sky(normalize(world-frame.eye.xyz)),1);
         return;
     }
     vec4 am=texture(albedoTex,uv), nr=texture(normalTex,uv);
@@ -66,9 +66,7 @@ void main() {
     }
     c+=am.rgb*(1-am.a)*mix(vec3(.085,.065,.055),vec3(.34,.40,.48),n.y*.5+.5);
     c+=mix(vec3(.04),am.rgb,am.a)*mix(sky(reflect(-v,n)),vec3(.31,.35,.4),nr.a)*.48;
-    if(frame.settings.w==1) c=n*.5+.5;
-    if(frame.settings.w==2) c=vec3(log(1+depth)/log(1+frame.splits.w));
-    if(frame.settings.w==3) c=fract(float(id)*vec3(.618,.317,.753));
-    if(frame.settings.w==4) c*=vec3[4](vec3(1,.45,.4),vec3(.5,1,.5),vec3(.4,.65,1),vec3(1,.8,.35))[cascade];
+    // 输出只有 Beauty。调试通道由 presentation 单独出图，光照结果不因它改变，
+    // 因此同一帧同时要 Beauty 与调试图时两者互不覆盖，历史里也只有 Beauty。
     outputColor=vec4(c,1);
 }

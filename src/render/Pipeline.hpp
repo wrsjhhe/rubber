@@ -29,9 +29,9 @@ struct Pipelines
 {
     Device& d;
     Lifetime life;
-    VkDescriptorSetLayout frame{}, material{}, lighting{}, resolve{}, colorSet{}, points{};
-    VkPipelineLayout meshLayout{}, lightLayout{}, resolveLayout{}, colorLayout{}, pointsLayout{};
-    VkPipeline shadow{}, geometry{}, shade{}, temporal{}, color{}, splat{}, splatDepth{};
+    VkDescriptorSetLayout frame{}, material{}, lighting{}, resolve{}, colorSet{}, points{}, presentationSet{};
+    VkPipelineLayout meshLayout{}, lightLayout{}, resolveLayout{}, colorLayout{}, pointsLayout{}, presentationLayout{};
+    VkPipeline shadow{}, geometry{}, shade{}, temporal{}, color{}, splat{}, splatDepth{}, presentation{};
     VkSampler point{}, linear{}, repeat{};
     explicit Pipelines(Device&, const std::filesystem::path&);
 };

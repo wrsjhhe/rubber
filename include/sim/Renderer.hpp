@@ -1,8 +1,10 @@
 #pragma once
 #include "Scene.hpp"
 #include "Output.hpp"
+#include "Observation.hpp"
 #include <vulkan/vulkan.h>
 #include <functional>
+#include <optional>
 #include <string>
 
 namespace sim
@@ -34,6 +36,7 @@ struct RenderOptions
     bool stableGeometry = false;
     bool taa = true, shadows = true, culling = true, readback = false, resetHistory = false;
     float exposure = 1;
+    // 调试呈现通道，只决定 Debug 输出显示什么，不进入 Color/Hdr。
     // 0 彩色，1 法线，2 米制深度，3 实例标签，4 级联分区。
     int debugChannel = 0;
 };
@@ -53,7 +56,11 @@ class View
     void wait() const;
     Frame read() const;
     VkImageView colorView() const;
+    // 调试呈现图像。窗口若要显示 Debug 通道就采样这一份，而不是让调试覆盖 Beauty。
+    VkImageView debugView() const;
     VkImageView imageView(Channel channel) const;
+    uint32_t width() const;
+    uint32_t height() const;
     uint32_t visibleMeshes() const;
     // 本帧提交绘制的点数；点云不在 CPU 侧剔除，因此等于快照中的点数。
     uint32_t visiblePoints() const;
@@ -77,6 +84,9 @@ struct RenderRequest
     View& view;
     std::vector<OutputDesc> outputs{{Channel::Color, Delivery::Cpu}};
     RenderOptions options;
+    // 采样语义。缺省表示以快照时间为采样时刻、瞬时曝光（duration 为 0）。
+    // 给定时 start 必须等于快照时间，否则 observe() 拒绝：观测不能声明没采过的时刻。
+    std::optional<SampleTime> sampleTime;
 };
 // 资产与共享场景的准备计数，供集成方和测试观察共享行为。
 struct AssetStats
@@ -100,6 +110,9 @@ class Renderer
     void render(const SceneSnapshot&, const PerspectiveCamera&, View&, const RenderOptions& = {});
     // 槽满时不等待结果的持有者，直接返回 Busy，避免调用线程自锁。
     Submission submit(const RenderRequest&);
+    // 与 submit 相同的一次提交，另附标定、采样时间与通道语义：结果只读，元数据与像素
+    // 属于同一次采样。槽满时同样返回 Busy。
+    ObservationResult observe(const RenderRequest&);
     // 只切换缓存代际，不销毁仍被在途提交引用的缓冲。
     void clearAssetCache();
     AssetStats assetStats() const;

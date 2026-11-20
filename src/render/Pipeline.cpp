@@ -136,6 +136,8 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
     lighting = setLayout(7, false);
     resolve = setLayout(4, false);
     colorSet = setLayout(1, false);
+    // 调试呈现：法线、米制深度、实例标签，加级联视图需要的 HDR。
+    presentationSet = setLayout(4, false);
     {
         // 点云实例缓冲：只读存储缓冲，顶点与片元都要读。
         VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -165,6 +167,7 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
     resolveLayout = layout(resolve);
     colorLayout = layout(colorSet);
     pointsLayout = layout(points);
+    presentationLayout = layout(presentationSet);
     GraphicsOptions mesh;
     GraphicsOptions zOnly;
     zOnly.depthBias = true;
@@ -186,6 +189,9 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
                          fullscreen);
     color = graphicsPipeline(d, life, dir, "fullscreen.vert", "color.frag", colorLayout, std::array{colorFormat},
                              fullscreen);
+    // 调试呈现写自己的图像：与 Beauty 同格式，但不共享附件，也不进入时序历史。
+    presentation = graphicsPipeline(d, life, dir, "fullscreen.vert", "presentation.frag", presentationLayout,
+                                    std::array{colorFormat}, fullscreen);
     // 点云写 HDR 与全部 G-buffer：深度、ID、米制深度与速度必须与网格一致，
     // 否则同一像素的几何真值与颜色会分属不同物体。
     const std::array<VkFormat, 6> splatFormats{colorFormat, hdrFormat, hdrFormat, VK_FORMAT_R32_SFLOAT,

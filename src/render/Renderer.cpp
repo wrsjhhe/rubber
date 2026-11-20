@@ -7,6 +7,7 @@
 #include "Module.hpp"
 #include "../modules/mesh/MeshModule.hpp"
 #include "../modules/points/PointsModule.hpp"
+#include "../presentation/Presentation.hpp"
 #include "../assets/AssetCache.hpp"
 #include "sim/VulkanInterop.hpp"
 #include <glm/gtc/matrix_transform.hpp>
@@ -197,14 +198,14 @@ struct View::Impl
     Pipelines& pipe;
     Lifetime life;
     uint32_t w, h, tile;
-    Img g[5], depth, hdr, history[2], display;
+    Img g[5], depth, hdr, history[2], display, debug;
     std::vector<std::weak_ptr<FrameResult>> results;
     std::weak_ptr<FrameResult> pendingExport;
     // 视图只保留相机相关状态：帧级共享资源、历史与模块的视图侧状态。
     Buf globals;
     VkCommandBuffer cmd{};
     VkFence fence{};
-    VkDescriptorSet frame{}, resolve[2]{}, colorSet[2]{};
+    VkDescriptorSet frame{}, resolve[2]{}, colorSet[2]{}, debugSet{};
     // 每个模块一份视图状态（阴影图、实例历史、点云描述符），由模块自己创建。
     std::vector<std::unique_ptr<vk::ModuleView>> modules;
     vk::FrameStats stats;
@@ -213,6 +214,8 @@ struct View::Impl
     std::shared_ptr<vk::FrameLifetime> retained;
     // 历史槽的奇偶只随真正写入历史的帧前进：不参与 TAA 的请求不能让历史失效或换槽。
     unsigned historyNumber = 0;
+    // 最近一帧真正写入的历史槽；-1 表示还没有可读的解析结果。
+    int resolvedSlot = -1;
     double time = 0;
     bool hasReadback = false, lastTaa = false;
     // 上一帧是否被判为静止（相机与所有模块的输入都与上一帧相同）。静止判定只在颜色帧上
@@ -297,6 +300,22 @@ struct View::Impl
             bindImage(d, colorSet[i], 0, *history[i], pipe.point);
         }
     }
+    // 调试呈现图：与显示图同格式，但只有请求调试图时才分配。它与 Beauty 各自一份，
+    // 因此同一帧既能看到真实颜色，也能看到调试通道。
+    void ensureDebug()
+    {
+        ensureColor();
+        if (debug)
+            return;
+        debug = d.image(w, h, colorFormat, vkUsageOf(colorUsage));
+        auto pool = descriptorPool(d, life, 1);
+        debugSet = allocateSet(d, pool, pipe.presentationSet);
+        // 与 presentation.frag 的绑定顺序一致：法线、米制深度、实例标签、HDR。
+        bindImage(d, debugSet, 0, *g[1], pipe.point);
+        bindImage(d, debugSet, 1, *g[3], pipe.point);
+        bindImage(d, debugSet, 2, *g[4], pipe.point);
+        bindImage(d, debugSet, 3, *hdr, pipe.point);
+    }
     // 瞬时资源按声明缓存：命中复用，帧首释放上一帧未使用的条目。
     Img& transientImage(const render::ImageDesc& desc)
     {
@@ -355,6 +374,10 @@ struct View::Impl
             return display.get();
         case Channel::Hdr:
             return hdr.get();
+        case Channel::Resolved:
+            return resolvedSlot < 0 ? nullptr : history[unsigned(resolvedSlot)].get();
+        case Channel::Debug:
+            return debug.get();
         case Channel::HardwareDepth:
             return depth.get();
         default:
@@ -393,7 +416,9 @@ Submission Renderer::submit(const RenderRequest& request)
         throw std::invalid_argument("View belongs to a different renderer");
     if (request.outputs.empty())
         throw std::invalid_argument("Request must contain at least one output");
-    std::array<bool, 8> seen{};
+    if (request.options.debugChannel < 0 || request.options.debugChannel > 4)
+        throw std::invalid_argument("Invalid debug channel");
+    std::array<bool, 10> seen{};
     bool color = false;
     std::vector<Channel> channels;
     for (auto output : request.outputs)
@@ -404,9 +429,15 @@ Submission Renderer::submit(const RenderRequest& request)
         if (output.delivery != Delivery::Cpu && output.delivery != Delivery::Gpu &&
             output.delivery != Delivery::CpuAndGpu)
             throw std::invalid_argument("Invalid output delivery");
+        // 调试图显示哪个通道由 RenderOptions 决定：没有选择就没有图可交付。
+        if (output.channel == Channel::Debug && request.options.debugChannel == 0)
+            throw std::invalid_argument("Debug output requires a debug channel");
         seen[i] = true;
         channels.push_back(output.channel);
-        color = color || output.channel == Channel::Color || output.channel == Channel::Hdr;
+        // 调试图属于颜色链路的呈现副本：它要读 G-buffer，级联视图还要读 HDR。
+        // 解析输出同样需要颜色链路：它就是本帧时序解析写回的历史槽。
+        color = color || output.channel == Channel::Color || output.channel == Channel::Hdr ||
+                output.channel == Channel::Resolved || output.channel == Channel::Debug;
     }
     std::erase_if(v.results, [](const auto& result) { return result.expired(); });
     if (v.results.size() >= 3)
@@ -420,9 +451,16 @@ Submission Renderer::submit(const RenderRequest& request)
     std::vector<Image*> sources;
     if (color)
         v.ensureColor();
+    if (request.options.debugChannel != 0)
+        v.ensureDebug();
+    // Resolved 的源是本帧将要写入的历史槽：请求它本身就让时序解析成为裁剪根，
+    // 因此这里的槽号与 renderFrame 将要写入的一致。
+    const unsigned resolvedSlot = v.historySlot();
+    auto sourceOf = [&](Channel channel) -> Image*
+    { return channel == Channel::Resolved ? v.history[resolvedSlot].get() : v.source(channel); };
     for (auto output : request.outputs)
     {
-        auto source = v.source(output.channel);
+        auto source = sourceOf(output.channel);
         if (!source)
             throw std::logic_error("Requested channel has no image");
         PixelFormat format = PixelFormat::Rgba8Unorm;
@@ -516,6 +554,19 @@ VkImageView View::colorView() const
     impl->ensureColor();
     return impl->display->view;
 }
+VkImageView View::debugView() const
+{
+    impl->ensureDebug();
+    return impl->debug->view;
+}
+uint32_t View::width() const
+{
+    return impl->w;
+}
+uint32_t View::height() const
+{
+    return impl->h;
+}
 VkImageView View::imageView(Channel channel) const
 {
     auto& v = *impl;
@@ -524,11 +575,18 @@ VkImageView View::imageView(Channel channel) const
     case Channel::Color:
         v.ensureColor();
         return v.display->view;
+    case Channel::Debug:
+        v.ensureDebug();
+        return v.debug->view;
     case Channel::HardwareDepth:
         return v.depth->view;
     case Channel::Hdr:
         v.ensureColor();
         return v.hdr->view;
+    case Channel::Resolved:
+        if (v.resolvedSlot < 0)
+            throw std::logic_error("Resolved has not been produced by this view");
+        return v.history[unsigned(v.resolvedSlot)]->view;
     default:
     {
         auto i = int(channel) - int(Channel::AlbedoMetal);
@@ -597,9 +655,13 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
         throw std::invalid_argument("View belongs to a different renderer");
     if (snapshot.lights.size() > 16 || glm::length(snapshot.sun.direction) < 1e-6f)
         throw std::invalid_argument("Invalid lights");
+    if (o.debugChannel < 0 || o.debugChannel > 4)
+        throw std::invalid_argument("Invalid debug channel");
     view.wait();
     if (color)
         v.ensureColor();
+    if (o.debugChannel != 0)
+        v.ensureDebug();
     // 上一帧已等待完成，此时才能替换共享平台缓冲与描述符绑定，也能安全回收瞬时资源。
     v.sweepTransients();
     v.beginTransients();
@@ -677,6 +739,14 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
         graph.bind(displayImage, *v.display);
         graph.bind(historyImage[0], *v.history[0]);
         graph.bind(historyImage[1], *v.history[1]);
+    }
+    // 调试呈现图独立于 Beauty：只有选了调试通道才导入，且只被 presentation 写。
+    render::ImageHandle debugImage;
+    if (o.debugChannel != 0)
+    {
+        debugImage = graph.importImage("debug", imageDesc(render::Format::Rgba8Unorm, v.w, v.h, colorUsage),
+                                       graphLayout(v.debug->layout), false);
+        graph.bind(debugImage, *v.debug);
     }
     const auto stagingBuffer = graph.createBuffer(
         "readback", {VkDeviceSize(v.w) * v.h * 12, render::BufferUsage::TransferDst | render::BufferUsage::HostRead});
@@ -756,6 +826,26 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     // 第二阶段：几何真值写回必须晚于时序解析与颜色变换。
     for (auto& module : v.modules)
         module->declareLate(res, v.stats);
+    // 调试呈现排在稳定几何之后：有稳定副本时读到的法线、深度与标签就是像素中心的值，
+    // 与同时交付的几何真值一致。它只写自己的图像，不参与时序解析与颜色变换。
+    if (debugImage)
+        graph.addPass(
+            graph.reserve("presentation"),
+            [&](render::FrameGraph::Declaration& d)
+            {
+                d.read(normalRough);
+                d.read(metric);
+                d.read(instanceId);
+                // 描述符在创建时就绑定了 HDR，级联视图也确实读它，因此这里总是声明：
+                // 声明与实际可访问的资源必须一致，否则屏障不会把该图转到可采样状态。
+                d.read(hdrImage);
+                d.read(globalsBuffer, Access::UniformRead);
+                d.write(debugImage, Access::ColorWrite);
+                // 选了调试通道，这一帧就产出调试图：窗口与集成方直接采样视图里的
+                // 这张图，不经过 FrameResult 的复制通道，因此它是本帧的必备输出。
+                d.sideEffect();
+            },
+            [&](VkCommandBuffer cmd) { recordPresentation(cmd, v.pipe, v.frame, v.debugSet, *v.debug); });
 
     if (o.readback)
         graph.addPass(
@@ -781,6 +871,10 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
             return displayImage;
         case Channel::Hdr:
             return hdrImage;
+        case Channel::Resolved:
+            return historyImage[slot];
+        case Channel::Debug:
+            return debugImage;
         case Channel::HardwareDepth:
             return depthImage;
         case Channel::AlbedoMetal:
@@ -804,11 +898,15 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     if (color)
         for (auto handle : {hdrImage, displayImage, historyImage[0], historyImage[1]})
             graph.restoreImage(handle, Layout::ShaderRead);
+    if (debugImage)
+        graph.restoreImage(debugImage, Layout::ShaderRead);
     graph.compile();
     // 只有真实写入了颜色历史的帧才能推进历史状态。"需要颜色"（res.color）不等于"时序解析
     // 执行了"：仅导出 Hdr 的请求没有 color 的导出根，未启用 TAA 时也没有副作用根，时序解析
     // 会被裁掉，此时颜色历史仍是上一份内容，提前推进会让下一帧误判静止并冻结旧图。
     const bool resolved = color && graph.executed(temporalHandle);
+    // 解析输出的可读槽位：未写入历史的帧没有 Resolved 可交付。
+    v.resolvedSlot = resolved ? int(slot) : -1;
     // 编译结果决定实际需要的瞬时资源：只分配存活的声明。
     for (auto& entry : graph.transients())
     {

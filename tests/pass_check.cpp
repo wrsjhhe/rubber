@@ -99,6 +99,30 @@ try
     expect(std::abs(frame.depth[24 * 64 + 32] - 4.5f) < .001f, "Readback lost the metric depth");
     expect(frame.ids[24 * 64 + 32] != 0, "Readback lost the instance label");
 
+    // 解析输出以本帧写回的历史槽为导出根：时序解析及其生产者保留，颜色变换没有消费者。
+    auto resolved = renderer.submit({snapshot, camera, *view, {{Channel::Resolved, Delivery::Cpu}}});
+    expect(resolved.status == SubmitStatus::Submitted, "Resolved delivery was rejected");
+    expectPasses(*view, {"shadow", "geometry", "lighting", "temporal"}, "Resolved delivery");
+    resolved.frame.reset();
+
+    // 调试图引入独立的呈现 pass；它读稳定 G-buffer，因此稳定几何副本也进入清单。
+    RenderOptions debug;
+    debug.debugChannel = 2;
+    auto debugged = renderer.submit({snapshot, camera, *view,
+                                     {{Channel::Color, Delivery::Cpu}, {Channel::Debug, Delivery::Cpu}}, debug});
+    expect(debugged.status == SubmitStatus::Submitted, "Debug delivery was rejected");
+    expectPasses(*view, {"history.clear", "shadow", "geometry", "lighting", "temporal", "geometry.stable", "color",
+                         "presentation"},
+                 "Debug request after a channel change");
+    debugged.frame.reset();
+
+    // 调试图不改变历史有效性：同一调试通道的下一帧没有清除，也没有多出别的 pass。
+    auto repeated = renderer.submit({snapshot, camera, *view,
+                                     {{Channel::Color, Delivery::Cpu}, {Channel::Debug, Delivery::Cpu}}, debug});
+    expectPasses(*view, {"shadow", "geometry", "lighting", "temporal", "geometry.stable", "color", "presentation"},
+                 "Repeated debug request");
+    repeated.frame.reset();
+
     std::cout << "PASS: frame graph culls passes to the requested outputs\n";
     return 0;
 }
