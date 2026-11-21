@@ -5,6 +5,7 @@
 #include "passes/Passes.hpp"
 #include "GraphBridge.hpp"
 #include "Module.hpp"
+#include "ShaderDirectory.hpp"
 #include "../modules/mesh/MeshModule.hpp"
 #include "../modules/points/PointsModule.hpp"
 #include "../presentation/Presentation.hpp"
@@ -63,8 +64,7 @@ struct Renderer::Impl final : AssetProvider
     explicit Impl(const DeviceOptions& o)
     {
         d.init(o);
-        shaderDirectory =
-            o.shaderDirectory.empty() ? std::filesystem::path(RENDERER_SHADER_DIR) : o.shaderDirectory;
+        shaderDirectory = vk::resolveShaderDirectory(o.shaderDirectory);
         pipelines = std::make_unique<Pipelines>(d, shaderDirectory);
         assets = std::make_shared<AssetCache>(d, *pipelines, stats, ++nextGeneration);
         modules.push_back(std::make_unique<MeshModule>(d, *pipelines, *this, stats));
@@ -404,6 +404,10 @@ const DeviceHandles& Renderer::handles() const
 VkSampler Renderer::displaySampler() const
 {
     return impl->pipelines->linear;
+}
+std::filesystem::path Renderer::shaderDirectory() const
+{
+    return impl->shaderDirectory;
 }
 std::unique_ptr<View> Renderer::createView(uint32_t w, uint32_t h, uint32_t tile)
 {

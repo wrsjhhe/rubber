@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.24)
+project(SimRendererPackageCheck LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# 只通过安装前缀找包：不 include 原项目的任何 CMake 文件，也不引用它的源码。
+find_package(SimRenderer 0.1 REQUIRED)
+add_executable(sim_package_check main.cpp)
+target_link_libraries(sim_package_check PRIVATE sim::renderer)
+if(MSVC)
+  target_compile_options(sim_package_check PRIVATE /utf-8 /EHsc)
+endif()

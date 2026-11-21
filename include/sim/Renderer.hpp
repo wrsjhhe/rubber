@@ -118,6 +118,9 @@ class Renderer
     AssetStats assetStats() const;
     const DeviceHandles& handles() const;
     VkSampler displaySampler() const;
+    // 本次实例实际使用的着色器目录（候选顺序与失败诊断见 ShaderDirectory.hpp）。
+    // 安装后出问题时先看这一项：它应当位于安装前缀之下，而不是源码或构建目录。
+    std::filesystem::path shaderDirectory() const;
 
   private:
     friend class View;
