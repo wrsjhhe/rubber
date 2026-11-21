@@ -163,7 +163,7 @@ Release、四项 CTest、asset_check --validation、Gallery smoke 独立通过�
 | F08 模块与点云 | 已有实现，待审核；render/Module.hpp、modules/mesh、modules/points、shaders/points.vert、shaders/points.frag、render/passes/PointsPass.cpp、tests/points_check.cpp | 点云不在 CPU 侧剔除，也不参与阴影投射；无逐点历史，运动向量写零（运动分支不复用旧像素），静止冻结靠每视图的颜色历史基线失效；点云仍需按节点逐点展开到一份共享缓冲，总量受 `maxStorageBufferRange` 限制，上传批暂存未主动回收；gallery 示例场景尚未加入点云。颜色历史基线（网格姿态与点云身份）只经 `ModuleView::commitHistory(true)` 推进，未写入历史的帧（仅 Hdr、几何真值）不改变基线 |
 | F09 观测与呈现 | 已有实现，已验收（428d264）；include/sim/Observation.hpp、include/sim/Processing.hpp、src/sensors、src/presentation、shaders/presentation.frag、tests/observation_check.cpp | 标定与投影一致、采样时刻等于快照时间、输出描述取自结果本身且尺寸/内参/近远平面自校验、通道语义表与十个通道一一对应；调试图写独立图像，Beauty/HDR 不受影响，几何-only + 调试通道同样产出调试图（该帧会跑光照并产出 HDR 与调试图，不执行时序解析与颜色变换；ensureDebug/ensureColor 仍会分配显示图与历史槽，物理资源按需拆分记为后续优化）；处理链只读观测、只写自己声明的派生输出，句柄只暴露只读描述与可写像素。曝光时长只是元数据（F12 才积分曝光），无畸变/噪声/运动模糊阶段，处理链只在 CPU 侧按通道字节工作，未接入 GPU 阶段 |
 | F10 安装分发 | 已验收（67e11ec）；CMakeLists.txt、cmake/SimRendererConfig.cmake.in、src/render/ShaderDirectory.hpp、src/render/ShaderDirectory.cpp、tests/package、tests/shader_check.cpp | 安装树自包含：`include/sim`、随包安装的 glm、静态库、预编译 SPIR-V、`lib/cmake/SimRenderer`；`find_package(SimRenderer)` 导出 `sim::renderer` 并只 `find_dependency(Vulkan 1.3)`。shader 目录不在二进制里指向源码/构建目录，运行时按显式目录 → `SIM_SHADER_DIR` → exe 相对布局 → 编译期安装目录解析。安装测试由 shader_check（解析顺序与诊断）与 package_check（全新前缀安装 + 外部项目 find_package 构建并离屏渲染 + 无环境变量必须失败）覆盖 |
-| F11—F17 | 未实现 | 后续规划，不列为已支持 |
+| F11—F17 | 规格已补齐（2026-11-21，见 FEATURES 各节），待立项开发 | 未实现，不列为已支持；每项的质量/性能门槛与"不做"范围已写入 FEATURES |
 
 GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 
@@ -177,8 +177,29 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 | M4 | M3；已验收（d3c0c1f） | 网格模块迁移、模块协议、点云 | points_check：同一快照两台相机下点在前/网格在前的遮挡互换、米制深度与实例标签取值、仅点云场景、点云 pass 相对网格 pass 的插入位置、强度→亮度与半径→覆盖互不影响、覆盖面积随分辨率平方增长；相同距离下俯仰/翻滚不改变覆盖、`fx != fy` 时足迹为椭圆；静止收敛后移动/删除/改强度的 Color 刷新、两相机各自的历史基线、几何真值交付不推进颜色基线；Hdr-only（关闭 TAA，时序解析被裁掉）不推进颜色历史与阈值基线、连续穿插 Hdr-only 不扰动颜色链路、网格移动 + Hdr-only 后颜色帧仍刷新。graph_check：读改写附件的 dstAccess 含读与写、普通覆盖写不含读。七项 CTest 与六项 --validation |
 | M5 | M4；已验收（428d264） | Observation、处理链入口、呈现隔离、互操作边界 | observation_check：标定反算的投影与渲染器一致（内参与视场角两条路径）、采样时刻必须等于快照时间（错时刻与负曝光被拒）、曝光区间作为元数据保留、错尺寸标定/非有限内参/空视锥被拒、输出清单等于请求且未请求通道读不出；同一帧 `{Color, Hdr, Debug}` 的 Beauty 与 HDR 逐字节等于不带调试的对照帧，调试图与 Beauty 不同且背景为零；只请求 Debug/Color 与级联通道同样不污染 Beauty，未选调试通道时请求 Debug 显式报错；Debug 的 GPU 交付与 `View::debugView()` 可用；曝光×4 + 调试通道 + TAA 抖动下米制深度与实例标签逐字节不变，而颜色改变；处理链的派生输出按输入通道计算、源观测真值不变，与通道同名/全链重名/写未声明名字都被拒绝，行跨度溢出 32 位在分配前被拒且阶段未执行；几何-only + 每种 debugChannel（1—4）在不请求 Debug 的情况下仍产出调试图，活跃清单含 `lighting`+`presentation`、不含 `temporal`/`color`，几何真值逐字节等于对照帧，GPU 交付路径同样成立。pass_check：Resolved 交付的活跃清单、Debug 请求新增 presentation 且稳定几何副本进入清单、重复调试帧不再清除历史。八项 CTest 与七项 --validation |
 | M6 | M5；已验收（67e11ec） | 安装头文件/库/shader、导出 target/依赖 | shader_check：构建树按可执行文件位置命中 `build/shaders`（默认安装路径不存在也不回落）、解析结果无 `..`、显式目录与环境变量有效即采用且显式优先、无效即报错并点名来源、尾部 `..` 归一化。package_check：安装到全新前缀后，安装树含公共头文件/随包 glm/静态库/全套 SPIR-V/包文件且无 GLSL 源码；包文件不含源码或构建目录引用；只认 `find_package(SimRenderer)` 的外部项目构建成功并离屏渲染（中心深度 4.5、6144 个非黑像素）；不设环境变量时必须失败且诊断点名配置的安装目录，设 `SIM_SHADER_DIR` 指向前缀后成功且 shader 目录在前缀之下。独立 `-DCMAKE_INSTALL_PREFIX=<新前缀> -DRENDERER_EXAMPLE=OFF` 构建 + 安装 + 外部项目无环境变量离屏渲染成功。十项 CTest 与七项 --validation |
+| M7 | M6；待开发（规格已就绪，见 FEATURES F11） | 镜头畸变：Brown-Conrady 映射、`lens` 重采样 pass、标定复算 | 标定板 3D 点在 r ≤ 0.9·min(fx,fy) 内投影与实测差 ≤ 0.5 px；径向位移与解析值差 ≤ 1e-3 px；深度/标签值集合不变且边界不混标签；源域外取背景值、--validation 0 条；开关畸变时 Resolved 逐字节相同；`lens` pass ≤ 0.8 ms、全帧增量 ≤ 5% |
+| M8 | M7；待开发（规格已就绪，见 FEATURES F12） | 曝光积分与相机运动模糊、滚动快门；`SampleTime::duration` 从元数据变为真实积分区间 | 1 m/s × 20 ms × fx=800 × 5 m 的模糊长度与 3.2 px 差 ≤ 0.5 px 且随 duration 线性；均匀板平均辐亮度差 ≤ 1%；静止 + 任意 duration 与 duration=0 一致；关闭曝光展宽 ≤ 1 px 而开启 ≥ 2.5 px（TAA 不能代替）；滚帘竖边倾斜 1.6 px ±0.3；真值通道在 1/2/4/16 子帧下逐字节相同 |
+| M9 | M8；待开发（规格已就绪，见 FEATURES F13） | 传感器噪声：散粒/读出/暗电流与深度距离噪声，按 seed 可复现 | 512×512 灰板均值偏差 ≤ 1%、方差相对误差 ≤ 5%、KS p > 0.01；gain 翻倍时方差 1/4 ±10%；同 seed 逐字节相同、异 seed ≥ 99% 像素不同；真值通道不变；平面 z=5 m 的深度噪声与 `a+b·z²` 差 ≤ 5%；零参数时派生输出等于输入 |
+| M10 | M9；待开发（规格已就绪，见 FEATURES F14） | 雨雪粒子：时间驱动的确定性生成、透明度与深度策略 | 静止相机连续帧有差异、同 time 逐字节相同；箱体后粒子不可见；粒子不写 `MetricDepth` 且标签高位标记非真值；可见粒子数与 density×体积 成正比 ±10%；无拖影；1 万粒子 ≤ 1.5 ms |
+| M11 | M8；待开发（规格已就绪，见 FEATURES F15） | 3D Gaussian：导入、协方差投影、桶排序、front-to-back 混合、`SplatDepth`/`SplatCoverage` | 两枚高斯前后顺序可交换、三枚与 CPU 参考差 ≤ 1 LSB；椭圆长短轴与解析值差 ≤ 1%；opacity=1 中心像素等于本色；`SplatDepth` 非真值且几何真值请求不含高斯；两相机一致；属性变化使历史失效；同输入逐字节相同；100 万高斯 ≤ 8 ms |
+| M12 | M11；待开发（F16a 规格已就绪，F16b/c 待补规格） | 真实感升级：先做 HDRI/IBL，透明与软阴影各自补规格后立项 | 常量环境漫反射与解析值差 ≤ 2%；镜面高光位置误差 ≤ 1 px；参考图 SSIM ≥ 0.98；关闭环境贴图时现有回归逐字节不变；预滤波 ≤ 60 ms、运行时 IBL ≤ 2 ms |
+| M13 | M12；待开发（规格已就绪，见 FEATURES F17） | 可选 DLSS：编译开关、运行期探测、抖动/运动向量/曝光协议、无 SDK 回退 | 无 SDK 时构建与全部 CTest 通过且与 TAA 逐字节相同、无 SDK 机器上 package_check 照常通过；有 SDK 时静止 SSIM ≥ 0.99、运动无鬼影、运动向量符号与幅度正确、曝光变化无闪烁、reset 一帧收敛；上采样 ≤ 2 ms |
 
-每项保留现有回归。F11—F17 分别立项，先补规格和质量/性能门槛。
+每项保留现有回归。F11—F17 的规格与质量/性能门槛已写入 [FEATURES](FEATURES.md)（2026-11-21），按 M7—M13 顺序立项；**性能门槛依赖 `gallery --bench`（每 pass 时间戳中位/p95），该模式在 M7 内交付，未交付前性能数字一律记为"待测量"**。F16b/F16c 与 F11 之后的子项开工前须先补规格。
+
+## 后续功能规格（2026-11-21，待审核）
+
+规格写在 [FEATURES](FEATURES.md)：F11—F17 各节给出范围、接口、语义、量化门槛、性能预算与"不做"；通用约定（单位与坐标系、真值与传感器输出的边界、确定性与 seed、SSIM/PSNR 与性能测量协议、立项交付物）集中在"通用规格约定"一节。这部分只描述目标，不代表任何代码已实现。
+
+需要审核确认的取舍：
+
+- **F11 畸变放在流水线末端**：几何、光照、TAA 都在无畸变空间，`lens` 最后按畸变公式反向采样；因此 TAA 的抖动与运动向量协议不变，`Resolved` 的内容与开关畸变无关。代价是边缘有效采样密度下降（与真实镜头一致），且调试图保持无畸变（它诊断 G-buffer，不是传感器成像）。
+- **F12 v1 只做相机运动模糊**：单帧 HDR + 运动向量重投影 N 次，不做多子帧重放几何与光照；物体运动模糊需要逐物体速度通道，明确不在本项。真值通道固定取 `time` 时刻单帧，积分结果只进 `Resolved`/`Color`。
+- **F13 v1 走 CPU 处理链**：派生输出 `noisy-color`/`noisy-depth`，不新增 Channel，真值通道逐字节不变；GPU 化列为后续。
+- **F15 深度语义**：高斯写独立的 `SplatDepth`/`SplatCoverage` 并标注非真值，`MetricDepth` 不含高斯；几何真值请求的活跃清单不得出现高斯 pass。
+- **性能门槛依赖 bench 工具**：`gallery --bench`（每 pass 时间戳中位/p95、预热 10 帧、采样 100 帧）尚未实现，定为 M7 内交付；在此之前性能数字一律记"待测量"，不得宣称达标。SSIM 阈值（IBL 0.98、DLSS 0.99）需在首次实现时校准并写回 FEATURES。
+
+未决项：F16b（透明）与 F16c（软阴影/区域光）只有立项流程、没有具体门槛，开工前必须补齐；F14 粒子与 F12 曝光的联动规则已写但未验证；F17 的抖动换算（Halton 序列与现有 TAA 抖动）需在实现时定稿。
 
 ## 已有验证与缺口
 
