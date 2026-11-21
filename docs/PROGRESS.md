@@ -1,5 +1,25 @@
 # 实现进度
 
+## 最新状态（2026-11-21 / M6 修复 67e11ec，待复审）
+
+**R-M6-001/002/003 已修复，待复审。** 三项都落在"包导出与测试的边界"上：
+
+1. **导出 target 传播 C++20（R-M6-001）**：`target_compile_features(renderer PUBLIC cxx_std_20)` 随 `install(EXPORT)` 生成 `INTERFACE_COMPILE_FEATURES`；外部消费者的 CMakeLists 刻意删掉自设的 `CMAKE_CXX_STANDARD`，只链接 `sim::renderer` 就得到正确的语言标准（生成的 vcxproj 里 `LanguageStandard=stdcpp20` 来自导出特性，不是消费者自己设的）。package_check 新增契约断言：安装出来的 SimRendererTargets.cmake 必须包含 `cxx_std_20`。
+2. **合法安装不再被判为失败（R-M6-002）**：真实配置前缀（编译进二进制的默认目录，用户机器上可能已有安装）只做**只读**状态检查——有 probe（`geometry.vert.spv`）→ 不带环境变量必须成功且报告的正是配置目录；没有 → 必须失败且诊断点名配置目录。绝不向该前缀写入或删除任何内容。
+3. **清理边界与保留性（R-M6-003）**：probe 缺失不再授予"目录所有权"，删除"装进用户配置前缀再清理"的整条路径。两个默认查找分支的确定性覆盖改由**测试工作目录内的专属隔离构建**完成（全新前缀是测试前缀下的 `iso` 子目录：配置 → 构建 → 安装 → 外部消费者 → 正例 → 清理 → 负例，一次运行内两分支必然都执行）；所有递归删除经过 `remove_test_tree`，先解析绝对路径、校验目标在测试前缀之内才删，越界即 FATAL。保留性测试三类：验证失败不触发清理（显式路径无效导致运行失败后，隔离安装原样保留）；已有 shader 目录但没有 probe（别的版本/别的用途）逐字节保留；前缀内的用户文件逐字节保留。
+
+本轮验证：Release 构建通过；十项 CTest 全通过（package_check 现含隔离构建，114 秒）；七项设备测试 `--validation` 各 0 条；`gallery --smoke`/`--capture --validation` 退出 0、0 条，捕获图与参考图差异 0.915%、`max_delta=1`，与上一轮捕获**逐字节相同**。对真实安装（`out/install/m6`，449 个文件）运行 package_check 走正例分支，安装树在测试前后逐字节相同。
+
+置信核对三处均先失败后还原：去掉 `target_compile_features` → "exported target must propagate the C++20 compile feature"（契约断言先抓到；外部消费者在未设标准下编译公开头同样会失败）；把第 5 步退回"无条件要求失败"的旧逻辑 → 对真实安装运行得到 "default lookup is too loose"（正是审核发现的误判）；`remove_test_tree` 传入测试目录之外的路径 → "refusing to remove a path outside the test working directory"，外部目录未受影响。
+
+## 工作树复审补充（2026-11-21）
+
+M6 仍需修改：C++20 PUBLIC 使用要求修复正确；package_check 当前用 probe 缺失判定可安装/清理，可能覆盖既有安装并删除原有 shader 目录，新增 R-M6-003。详见 [审核报告](REVIEW_M6.md)。该测试本轮未运行，需改为只读检查真实配置前缀、仅在隔离测试前缀内安装和清理。
+
+## 最新独立审核（2026-11-21 / acb4eb4）
+
+**M6 需修改，尚未验收。** 独立 Release 与十项 CTest（含安装/外部消费）通过；发现导出 target 未传播 C++20，以及 package_check 在配置前缀已有合法安装时错误要求启动失败两项问题。详见 [M6 审核报告](REVIEW_M6.md)。本节优先于下方待审核记录。
+
 ## 最新状态（2026-11-21 / M6 acb4eb4，待审核）
 
 **M6 已实现，待审核。** 安装、导出与 shader 定位：`cmake --install` 把公共头文件（`include/sim`）、静态库、预编译 SPIR-V 与 CMake 包文件装进一个自包含的前缀；glm 作为接口目标随包安装（公共头文件直接暴露 `glm::mat4`，消费者不必另找一份可能不同版本的 glm）；`find_package(SimRenderer)` 得到 `sim::renderer`，包配置只 `find_dependency(Vulkan 1.3)`、不请求 glslc（着色器已预编译）。二进制里的默认 shader 目录指向**配置时的安装前缀**而不是构建目录；运行时按"显式 `DeviceOptions::shaderDirectory` → 环境变量 `SIM_SHADER_DIR` → 可执行文件相邻的常见布局 → 编译期安装目录"解析，取第一个含 `geometry.vert.spv` 的目录。前两级是调用方的意图（设了就必须有效，否则报错），后两级是搜索；构建树的可执行文件靠 exe 相对路径命中 `build/shaders`，因此同一份二进制在两种布局下都工作，且不含源码或构建目录的 shader 路径。
@@ -179,6 +199,19 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 M5 新增缺项：处理链只有 CPU 侧按通道字节实现的 `SensorStage`，尚未接入 GPU pass，"阶段"与帧图资源没有绑定关系；`SampleTime::duration` 只是元数据，曝光积分、运动模糊与卷帘快门都未实现，因此 `end()` 与 `time()` 的差在下游还没有可观察效果。`SensorCalibration` 只描述针孔投影与近远平面，没有畸变系数、主点单位以外的像素宽高比、也没有与真实传感器模型对齐的量化/噪声项；焦距与主点的真值无法从帧反推，只能由调用方负责，观测只拒绝可验证的矛盾（尺寸、通道、有限性与视锥）。`Channel::Resolved` 的 A 分量是本帧米制深度，`Channel::Hdr` 的 A 分量是覆盖率，两者语义不同但都编码在 alpha 里，尚未在类型上区分。调试通道已覆盖 1—4 四档（含几何-only 与颜色链路两条路径），宽高比非 1 的窗口与超宽视野下的调试图仍未单独验证；调试图的内容断言只到"背景为零、物体处非零"，没有逐像素参考。派生输出的句柄把改名/改尺寸变成编译错误，但绕过方式（`const_cast`、越界写像素）不在类型系统的保护范围内，也没有运行时守卫。呈现隔离只对 Color/HDR/Debug 三条输出证明互不覆盖，`Resolved` 与 `Debug` 同时请求时的活跃清单由 pass_check 覆盖，但"同帧同时读 Resolved 与 Debug 且带 TAA"未加断言。观测结果与处理链都按值拷贝通道字节，大分辨率下的额外拷贝开销未测量。
 
 ## 交接记录
+
+### M6 修复 / F10（回应 REVIEW_M6：R-M6-001/002/003）
+
+任务编号 / 功能编号：M6 / F10
+负责人 / 日期 / 状态：开发者 / 2026-11-21 / 待复审
+代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支 67e11ec（接 acb4eb4/a6f3ac7）
+修改文件 / 接口变化：
+- `CMakeLists.txt`：`target_compile_features(renderer PUBLIC cxx_std_20)`（语言标准随导出 target 传播）；package_check 传参去掉 `ConfiguredPrefix`（不再需要），TIMEOUT 提到 1800 秒（测试内含一次隔离构建）
+- `tests/package/CMakeLists.txt`：删掉自设的 `CMAKE_CXX_STANDARD`——语言标准必须由导出的 sim::renderer 通过 INTERFACE_COMPILE_FEATURES 带过来，消费者自己设置会把缺失掩盖掉（R-M6-001 正是这么漏掉的）
+- `tests/package/check.cmake`：真实配置前缀改为只读状态检查（probe 存在 → 正例、缺失或目录里没有 probe → 负例，零写入零删除）；两分支确定性覆盖改为测试前缀内的隔离构建（iso：配置 → 构建 → 安装 → 外部消费者 → 正例 → 清理 → 负例）；`remove_test_tree` 解析绝对路径并校验目标在测试前缀之内才递归删除，越界 FATAL；保留性测试（验证失败不清理、无 probe 的旧 shader 目录保留、用户文件保留）；新增导出特性契约断言（Targets.cmake 必须含 `cxx_std_20`）
+- 消费者项目自身不再设置语言标准；`sim_package_check` 的 vcxproj 由导出特性得到 `LanguageStandard=stdcpp20`
+
+证据与置信核对：见"最新状态（M6 修复，待复审）"。缺陷注入三处（去导出特性、退回无条件失败、越界清理）均先失败后还原。
 
 ### M6 / F10（安装分发）
 

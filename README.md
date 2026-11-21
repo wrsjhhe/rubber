@@ -18,7 +18,7 @@ ctest --test-dir build -C Release --output-on-failure
 - `gallery --model path/to/asset.glb` 将静态不透明 glTF 模型放到展台上，也支持含外部缓冲和图片的 .gltf。
 - `gallery --capture image.png` 无窗口渲染并导出 PNG。可与 `--model` 组合。
 - `gallery --benchmark` 实测 1、4、8 个视图的批次耗时。每轮预热后统计 120 个批次，包含快照、录制、提交及最后一批 GPU 完成等待。
-- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单，`points_check --validation` 核对点云与网格的双向遮挡、强度/半径语义、相机姿态与双轴内参下的点尺寸，以及点云变化后 TAA 历史是否刷新、仅 Hdr 请求是否误推进历史基线，`observation_check --validation` 核对标定与投影一致、采样时刻、Beauty 与调试图同帧互不串色、真值通道独立于曝光与抖动、处理链无法覆盖真值。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断；`shader_check` 同样不需要设备，检查着色器目录的解析顺序与失败诊断；`package_check` 由 CTest 驱动，把当前构建安装到全新前缀、核对安装树契约，再让一个只认 `find_package` 的外部项目构建并离屏渲染（见下节）。validation 模式需要 SDK 验证层。
+- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单，`points_check --validation` 核对点云与网格的双向遮挡、强度/半径语义、相机姿态与双轴内参下的点尺寸，以及点云变化后 TAA 历史是否刷新、仅 Hdr 请求是否误推进历史基线，`observation_check --validation` 核对标定与投影一致、采样时刻、Beauty 与调试图同帧互不串色、真值通道独立于曝光与抖动、处理链无法覆盖真值。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断；`shader_check` 同样不需要设备，检查着色器目录的解析顺序与失败诊断；`package_check` 由 CTest 驱动，把当前构建安装到全新前缀、核对安装树契约（含导出 target 必须带 `cxx_std_20` 编译特性），再让一个只认 `find_package` 的外部项目构建并离屏渲染（见下节）；配置前缀只做只读检查，两个默认查找分支由测试目录内的隔离构建覆盖，脚本的全部写入与递归清理都限制在自己的测试前缀内。validation 模式需要 SDK 验证层。
 - 仅编译引擎可传入 `-DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF`。gallery 在构建树里靠可执行文件相对路径找到着色器，示例资产仍来自源码目录；安装与外部消费见下节。
 - `python tools/pngdiff.py a.png b.png` 统计两张 PNG 的差异字节数、最大与平均通道差，用于核对捕获画面是否只差舍入。
 
@@ -37,7 +37,7 @@ find_package(SimRenderer 0.1 REQUIRED)
 target_link_libraries(app PRIVATE sim::renderer)
 ```
 
-包配置只请求 `find_dependency(Vulkan 1.3)`——着色器已预编译为 SPIR-V，消费者不需要 glslc。着色器目录按以下顺序解析，取第一个含 `geometry.vert.spv` 的：
+包配置只请求 `find_dependency(Vulkan 1.3)`——着色器已预编译为 SPIR-V，消费者不需要 glslc。导出的 target 带 `cxx_std_20` 编译特性，消费者不必自己设置 C++ 标准。着色器目录按以下顺序解析，取第一个含 `geometry.vert.spv` 的：
 
 1. `DeviceOptions::shaderDirectory`——显式指定，设了就必须有效，否则报错；
 2. 环境变量 `SIM_SHADER_DIR`——同上；
