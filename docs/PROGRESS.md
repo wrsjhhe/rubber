@@ -1,5 +1,17 @@
 # 实现进度
 
+## 最新状态（2026-11-21 / M6 acb4eb4，待审核）
+
+**M6 已实现，待审核。** 安装、导出与 shader 定位：`cmake --install` 把公共头文件（`include/sim`）、静态库、预编译 SPIR-V 与 CMake 包文件装进一个自包含的前缀；glm 作为接口目标随包安装（公共头文件直接暴露 `glm::mat4`，消费者不必另找一份可能不同版本的 glm）；`find_package(SimRenderer)` 得到 `sim::renderer`，包配置只 `find_dependency(Vulkan 1.3)`、不请求 glslc（着色器已预编译）。二进制里的默认 shader 目录指向**配置时的安装前缀**而不是构建目录；运行时按"显式 `DeviceOptions::shaderDirectory` → 环境变量 `SIM_SHADER_DIR` → 可执行文件相邻的常见布局 → 编译期安装目录"解析，取第一个含 `geometry.vert.spv` 的目录。前两级是调用方的意图（设了就必须有效，否则报错），后两级是搜索；构建树的可执行文件靠 exe 相对路径命中 `build/shaders`，因此同一份二进制在两种布局下都工作，且不含源码或构建目录的 shader 路径。
+
+证据分两层。`shader_check`（无 GPU）锁解析顺序、显式/环境变量的优先级、路径归一化与失败诊断文本。`package_check`（CTest）把当前构建装进全新前缀，断言安装树契约（头文件、库、全套 SPIR-V、包文件；GLSL 源码不得进入），断言包文件不含源码或构建目录引用，然后只用 `find_package` 构建一个外部消费者并离屏渲染；它还验证**不设环境变量时必须失败**、诊断点名配置的安装目录——防止默认解析悄悄回落到构建目录——再验证设 `SIM_SHADER_DIR` 指向前缀后渲染成功且 shader 目录确实在前缀之下。另外用独立构建目录以 `-DCMAKE_INSTALL_PREFIX=<新前缀> -DRENDERER_EXAMPLE=OFF` 完成第二次构建与安装，外部消费者不设任何环境变量即成功离屏渲染（中心深度 4.5、6144 个非黑像素），锁定"按配置前缀安装即可用、关闭 example 可构建"。
+
+## 最新独立验收（2026-11-21 / 428d264）
+
+**M5 已验收，可进入 M6。** 三项审核问题关闭；独立 Release、八项 CTest、七项 --validation 和 Gallery smoke 通过，TAA 指标与交接一致。详见 [最终复审](REVIEW_M5.md)。本节取代历史待审核/需修改状态。
+
+交接表述更正：几何-only + debug 不执行 temporal/color，但 ensureDebug/ensureColor 仍会分配 display/history；只是不将它们导入该帧图，不能宣称完全不分配。物理资源进一步按需拆分记为非阻塞优化。
+
 ## 最新状态（2026-11-20 / M5 修复 428d264，待复审）
 
 **R-M5-001/002/003 已修复，待复审。** 三项的根因都是"契约只在文档里，代码路径没有围栏"，修法都落在结构上而不是加判断：
@@ -119,8 +131,8 @@ Release、四项 CTest、asset_check --validation、Gallery smoke 独立通过�
 | F02 缓存拆分 | 已验收（278371f）；render/RenderScene.hpp、render/RenderScene.cpp、assets/AssetCache.hpp、backend/Device.hpp、tests/asset_check.cpp | 场景准备仍在调用线程录制；实例缓冲按快照版本重新分配，未跨版本复用；上传批未限流 |
 | F07 帧图 | 已有实现，待审核；render/graph/FrameGraph.hpp、FrameGraph.cpp、tests/graph_check.cpp | 单队列顺序执行；保守屏障（每 pass 保守 stage/access，不做合并优化）；瞬时资源按描述缓存复用，未做显存别名。`readWrite` 的附件屏障按读改写补 `COLOR_ATTACHMENT_READ`，由 graph_check 断言；`executed(PassHandle)` 暴露编译后的裁剪结果，供调度侧判断跨帧副作用是否真的发生 |
 | F08 模块与点云 | 已有实现，待审核；render/Module.hpp、modules/mesh、modules/points、shaders/points.vert、shaders/points.frag、render/passes/PointsPass.cpp、tests/points_check.cpp | 点云不在 CPU 侧剔除，也不参与阴影投射；无逐点历史，运动向量写零（运动分支不复用旧像素），静止冻结靠每视图的颜色历史基线失效；点云仍需按节点逐点展开到一份共享缓冲，总量受 `maxStorageBufferRange` 限制，上传批暂存未主动回收；gallery 示例场景尚未加入点云。颜色历史基线（网格姿态与点云身份）只经 `ModuleView::commitHistory(true)` 推进，未写入历史的帧（仅 Hdr、几何真值）不改变基线 |
-| F09 观测与呈现 | 已有实现，待复审（R-M5-001/002/003 已修复）；include/sim/Observation.hpp、include/sim/Processing.hpp、src/sensors、src/presentation、shaders/presentation.frag、tests/observation_check.cpp | 标定与投影一致、采样时刻等于快照时间、输出描述取自结果本身且尺寸/内参/近远平面自校验、通道语义表与十个通道一一对应；调试图写独立图像，Beauty/HDR 不受影响，几何-only + 调试通道同样产出调试图（该帧会跑光照，但不建显示图与历史槽）；处理链只读观测、只写自己声明的派生输出，句柄只暴露只读描述与可写像素。曝光时长只是元数据（F12 才积分曝光），无畸变/噪声/运动模糊阶段，处理链只在 CPU 侧按通道字节工作，未接入 GPU 阶段 |
-| F10 | 待开发 | 无 install/export/find_package 验证 |
+| F09 观测与呈现 | 已有实现，已验收（428d264）；include/sim/Observation.hpp、include/sim/Processing.hpp、src/sensors、src/presentation、shaders/presentation.frag、tests/observation_check.cpp | 标定与投影一致、采样时刻等于快照时间、输出描述取自结果本身且尺寸/内参/近远平面自校验、通道语义表与十个通道一一对应；调试图写独立图像，Beauty/HDR 不受影响，几何-only + 调试通道同样产出调试图（该帧会跑光照并产出 HDR 与调试图，不执行时序解析与颜色变换；ensureDebug/ensureColor 仍会分配显示图与历史槽，物理资源按需拆分记为后续优化）；处理链只读观测、只写自己声明的派生输出，句柄只暴露只读描述与可写像素。曝光时长只是元数据（F12 才积分曝光），无畸变/噪声/运动模糊阶段，处理链只在 CPU 侧按通道字节工作，未接入 GPU 阶段 |
+| F10 安装分发 | 已有实现，待审核；CMakeLists.txt、cmake/SimRendererConfig.cmake.in、src/render/ShaderDirectory.hpp、src/render/ShaderDirectory.cpp、tests/package、tests/shader_check.cpp | 安装树自包含：`include/sim`、随包安装的 glm、静态库、预编译 SPIR-V、`lib/cmake/SimRenderer`；`find_package(SimRenderer)` 导出 `sim::renderer` 并只 `find_dependency(Vulkan 1.3)`。shader 目录不在二进制里指向源码/构建目录，运行时按显式目录 → `SIM_SHADER_DIR` → exe 相对布局 → 编译期安装目录解析。安装测试由 shader_check（解析顺序与诊断）与 package_check（全新前缀安装 + 外部项目 find_package 构建并离屏渲染 + 无环境变量必须失败）覆盖 |
 | F11—F17 | 未实现 | 后续规划，不列为已支持 |
 
 GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
@@ -133,12 +145,14 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 | M2 | M1；已验收（278371f） | RenderScene、共享静态实例数据、不可变资产版本、上传依赖、延迟回收 | asset_check：同快照两相机准备与上传各一次、旧快照在原对象被修改后与清缓存后仍重现原画面、身份不复用、静止收敛后换贴图的 Color 更新、上传批与暂存回落、旧代际最终回收、渲染输入只读的编译期断言 |
 | M3 | M2；已验收（715233d） | 帧图及六类独立 pass，资源声明与分配分离 | graph_check：裁剪、未初始化读取（图像与缓冲逐区间，含"局部写+整体覆写"合并路径）、同 pass 读写冲突、循环依赖、子资源精确展开、缓冲分段导出与生产者、跨子资源/跨区间 RAW/WAR/WAW、分段读后覆写的每段屏障源状态、usage 诊断、导出终态；pass_check：按输出通道断言活跃 pass 清单（含首帧历史清除与状态变化后的重建）；六项 CTest 与五项 --validation |
 | M4 | M3；已验收（d3c0c1f） | 网格模块迁移、模块协议、点云 | points_check：同一快照两台相机下点在前/网格在前的遮挡互换、米制深度与实例标签取值、仅点云场景、点云 pass 相对网格 pass 的插入位置、强度→亮度与半径→覆盖互不影响、覆盖面积随分辨率平方增长；相同距离下俯仰/翻滚不改变覆盖、`fx != fy` 时足迹为椭圆；静止收敛后移动/删除/改强度的 Color 刷新、两相机各自的历史基线、几何真值交付不推进颜色基线；Hdr-only（关闭 TAA，时序解析被裁掉）不推进颜色历史与阈值基线、连续穿插 Hdr-only 不扰动颜色链路、网格移动 + Hdr-only 后颜色帧仍刷新。graph_check：读改写附件的 dstAccess 含读与写、普通覆盖写不含读。七项 CTest 与六项 --validation |
-| M5 | M4；已有实现，待复审（R-M5-001/002/003 已修复） | Observation、处理链入口、呈现隔离、互操作边界 | observation_check：标定反算的投影与渲染器一致（内参与视场角两条路径）、采样时刻必须等于快照时间（错时刻与负曝光被拒）、曝光区间作为元数据保留、错尺寸标定/非有限内参/空视锥被拒、输出清单等于请求且未请求通道读不出；同一帧 `{Color, Hdr, Debug}` 的 Beauty 与 HDR 逐字节等于不带调试的对照帧，调试图与 Beauty 不同且背景为零；只请求 Debug/Color 与级联通道同样不污染 Beauty，未选调试通道时请求 Debug 显式报错；Debug 的 GPU 交付与 `View::debugView()` 可用；曝光×4 + 调试通道 + TAA 抖动下米制深度与实例标签逐字节不变，而颜色改变；处理链的派生输出按输入通道计算、源观测真值不变，与通道同名/全链重名/写未声明名字都被拒绝，行跨度溢出 32 位在分配前被拒且阶段未执行；几何-only + 每种 debugChannel（1—4）在不请求 Debug 的情况下仍产出调试图，活跃清单含 `lighting`+`presentation`、不含 `temporal`/`color`，几何真值逐字节等于对照帧，GPU 交付路径同样成立。pass_check：Resolved 交付的活跃清单、Debug 请求新增 presentation 且稳定几何副本进入清单、重复调试帧不再清除历史。八项 CTest 与七项 --validation |
-| M6 | M5；待开发 | 安装头文件/库/shader、导出 target/依赖 | 新安装前缀的外部项目 find_package 构建并离屏运行，不访问原源码/构建目录；关闭 example 可构建 |
+| M5 | M4；已验收（428d264） | Observation、处理链入口、呈现隔离、互操作边界 | observation_check：标定反算的投影与渲染器一致（内参与视场角两条路径）、采样时刻必须等于快照时间（错时刻与负曝光被拒）、曝光区间作为元数据保留、错尺寸标定/非有限内参/空视锥被拒、输出清单等于请求且未请求通道读不出；同一帧 `{Color, Hdr, Debug}` 的 Beauty 与 HDR 逐字节等于不带调试的对照帧，调试图与 Beauty 不同且背景为零；只请求 Debug/Color 与级联通道同样不污染 Beauty，未选调试通道时请求 Debug 显式报错；Debug 的 GPU 交付与 `View::debugView()` 可用；曝光×4 + 调试通道 + TAA 抖动下米制深度与实例标签逐字节不变，而颜色改变；处理链的派生输出按输入通道计算、源观测真值不变，与通道同名/全链重名/写未声明名字都被拒绝，行跨度溢出 32 位在分配前被拒且阶段未执行；几何-only + 每种 debugChannel（1—4）在不请求 Debug 的情况下仍产出调试图，活跃清单含 `lighting`+`presentation`、不含 `temporal`/`color`，几何真值逐字节等于对照帧，GPU 交付路径同样成立。pass_check：Resolved 交付的活跃清单、Debug 请求新增 presentation 且稳定几何副本进入清单、重复调试帧不再清除历史。八项 CTest 与七项 --validation |
+| M6 | M5；已有实现，待审核 | 安装头文件/库/shader、导出 target/依赖 | shader_check：构建树按可执行文件位置命中 `build/shaders`（默认安装路径不存在也不回落）、解析结果无 `..`、显式目录与环境变量有效即采用且显式优先、无效即报错并点名来源、尾部 `..` 归一化。package_check：安装到全新前缀后，安装树含公共头文件/随包 glm/静态库/全套 SPIR-V/包文件且无 GLSL 源码；包文件不含源码或构建目录引用；只认 `find_package(SimRenderer)` 的外部项目构建成功并离屏渲染（中心深度 4.5、6144 个非黑像素）；不设环境变量时必须失败且诊断点名配置的安装目录，设 `SIM_SHADER_DIR` 指向前缀后成功且 shader 目录在前缀之下。独立 `-DCMAKE_INSTALL_PREFIX=<新前缀> -DRENDERER_EXAMPLE=OFF` 构建 + 安装 + 外部项目无环境变量离屏渲染成功。十项 CTest 与七项 --validation |
 
 每项保留现有回归。F11—F17 分别立项，先补规格和质量/性能门槛。
 
 ## 已有验证与缺口
+
+本轮（M6）：Release 构建通过；十项 CTest 全通过（新增 shader_check、package_check）；七项设备测试 `--validation` 各 0 条；gallery `--smoke --validation` 与 `--capture m6-capture.png --validation` 退出 0、0 条，捕获图与参考图差异 37472/4096000（0.915%）、`max_delta=1`，且与 `m5fix-capture.png` 逐字节相同；`temporal_check` 数值逐位不变。独立验收路径（配置期即指定安装前缀、关闭 example 的第二次构建）由 build-m6 前缀完成：安装 + 外部消费者无环境变量离屏渲染成功。四处置信核对均先失败后还原：不安装 SPIR-V → “compiled shader is missing from the install tree”；不安装 glm 头文件 → “vendored glm header is missing from the install tree”；导出命名空间写错 → 外部项目 configure 失败（找不到 `sim::renderer`）；默认 shader 目录改回构建目录 → “external project ran without finding installed shaders”（正是 F10 要堵的路径）。
 
 本轮（M5 修复）：Release 构建成功；八项 CTest 全通过；七项 `--validation` 各 0 条；`gallery --smoke --validation` 与 `--capture m5fix-capture.png --validation` 退出 0、0 条，捕获图与参考图差异 37472/4096000（0.915%）、`max_delta=1`，与 `m5-capture.png` 逐字节相同；`temporal_check` 数值逐位不变。新增用例覆盖审核者点名的确切组合：几何-only 请求（不含 Debug 输出）+ `debugChannel` 1—4、几何真值的 CPU 与 GPU 交付、处理链的行跨度溢出与全链重名、观测的错尺寸标定/非有限内参/空视锥。四处置信核对：`lighting` 退回 `color` → “Frame graph read of an unknown image”；去掉溢出检查 → “Chain allocated a derived output whose stride overflows 32 bits”；去掉标定尺寸校验 → “Observation accepted a calibration that does not match the frame”；把描述句柄改为可变 → 编译失败（`const DerivedDesc` 不能转成 `DerivedDesc&`）。
 
@@ -160,11 +174,26 @@ GPU 遮挡剔除已移除，保留 CPU 视锥剔除。
 
 缺陷注入核对：把 TAA 历史比较临时放宽为只比几何与变换（去掉材质与贴图身份）后，asset_check 在"Texture swap kept frozen TAA history"处失败；把几何包围盒改回可变成员后，asset_check 以 `static_assert failed: 'Bounds are mutable'`（C2338）编译失败。两处用例因此确认有效，均已还原。
 
-尚缺显存分配自动统计证据、多队列/异步计算路径、显存别名复用，以及安装测试。点云已由 points_check 覆盖单点数据、双相机遮挡、仅点云场景、两种分辨率、强度/半径语义、相机姿态与双轴内参下的足迹、静止收敛后移动/删除/改强度与几何真值帧的颜色刷新，以及 Hdr-only 与穿插 Hdr-only 帧的历史提交条件；尚未覆盖大规模点云、逐点运动、阴影投射与上传批暂存回收。活跃 pass 清单已由 pass_check 按输出通道逐项断言，但只覆盖本仓库现存的通道组合，未覆盖全部请求×交付×选项组合。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。
+尚缺显存分配自动统计证据、多队列/异步计算路径、显存别名复用。点云已由 points_check 覆盖单点数据、双相机遮挡、仅点云场景、两种分辨率、强度/半径语义、相机姿态与双轴内参下的足迹、静止收敛后移动/删除/改强度与几何真值帧的颜色刷新，以及 Hdr-only 与穿插 Hdr-only 帧的历史提交条件；尚未覆盖大规模点云、逐点运动、阴影投射与上传批暂存回收。活跃 pass 清单已由 pass_check 按输出通道逐项断言，但只覆盖本仓库现存的通道组合，未覆盖全部请求×交付×选项组合。清缓存安全性由 asset_check 的在途结果覆盖，尚未覆盖多视图同时提交的压力场景。引擎未安装 debug messenger，验证层输出只经层默认渠道，未见报错但可见性有限。安装分发（M6）的新增缺项：二进制自带的默认 shader 目录绑定**配置时**的安装前缀，用 `cmake --install --prefix` 装到别的位置时需要 `SIM_SHADER_DIR`、`DeviceOptions::shaderDirectory` 或把应用装进同一前缀布局（诊断文本列出全部候选）；只导出静态库，未提供动态库与符号导出表；安装不做组件拆分（头文件、shader、运行库不能分开装/不装）；`package_check` 的外部项目依赖本机的 Vulkan SDK 环境与 VS 生成器，其离屏渲染证据只覆盖本仓库现存的通道组合；glm 以源码形式随包安装，消费侧不能与系统另一份 glm 混用包含路径。
 
 M5 新增缺项：处理链只有 CPU 侧按通道字节实现的 `SensorStage`，尚未接入 GPU pass，"阶段"与帧图资源没有绑定关系；`SampleTime::duration` 只是元数据，曝光积分、运动模糊与卷帘快门都未实现，因此 `end()` 与 `time()` 的差在下游还没有可观察效果。`SensorCalibration` 只描述针孔投影与近远平面，没有畸变系数、主点单位以外的像素宽高比、也没有与真实传感器模型对齐的量化/噪声项；焦距与主点的真值无法从帧反推，只能由调用方负责，观测只拒绝可验证的矛盾（尺寸、通道、有限性与视锥）。`Channel::Resolved` 的 A 分量是本帧米制深度，`Channel::Hdr` 的 A 分量是覆盖率，两者语义不同但都编码在 alpha 里，尚未在类型上区分。调试通道已覆盖 1—4 四档（含几何-only 与颜色链路两条路径），宽高比非 1 的窗口与超宽视野下的调试图仍未单独验证；调试图的内容断言只到"背景为零、物体处非零"，没有逐像素参考。派生输出的句柄把改名/改尺寸变成编译错误，但绕过方式（`const_cast`、越界写像素）不在类型系统的保护范围内，也没有运行时守卫。呈现隔离只对 Color/HDR/Debug 三条输出证明互不覆盖，`Resolved` 与 `Debug` 同时请求时的活跃清单由 pass_check 覆盖，但"同帧同时读 Resolved 与 Debug 且带 TAA"未加断言。观测结果与处理链都按值拷贝通道字节，大分辨率下的额外拷贝开销未测量。
 
 ## 交接记录
+
+### M6 / F10（安装分发）
+
+任务编号 / 功能编号：M6 / F10
+负责人 / 日期 / 状态：开发者 / 2026-11-21 / 待审核
+代码版本（commit；无 Git 时文件清单和 SHA256）：dev 分支 acb4eb4（接 428d264/3f82621）
+修改文件 / 接口变化：
+- `CMakeLists.txt`：GNUInstallDirs + CMakePackageConfigHelpers；新增 `sim_glm` 接口目标（BUILD_INTERFACE/INSTALL_INTERFACE 双包含目录）并随包安装 glm 头文件；`install(TARGETS renderer sim_glm EXPORT SimRendererTargets ...)`、`install(EXPORT ... NAMESPACE sim::)`、`configure_package_config_file` + `write_basic_package_version_file`（SameMajorVersion）；SPIR-V 按本轮产物清单安装（不整装目录，避免带上改名前的旧文件）；`RENDERER_SHADER_DIR` 从构建目录改为 `${CMAKE_INSTALL_FULL_DATADIR}/sim/shaders`；GLFW 强制 `GLFW_INSTALL=OFF`（否则它的头文件与 cmake/pkg-config 配置会混进安装前缀）
+- `cmake/SimRendererConfig.cmake.in`（新增）：`find_dependency(Vulkan 1.3)`（不请求 glslc，着色器已预编译）；导出 `SimRenderer_SHADER_DIR` 供 `--prefix` 异地安装时显式传入
+- `src/render/ShaderDirectory.hpp/.cpp`（新增）：`resolveShaderDirectory` 按"显式目录（严格）→ `SIM_SHADER_DIR`（严格）→ exe 相对布局（搜索）→ 编译期安装目录（搜索）"解析，探测文件 `geometry.vert.spv`；全部落空时抛出列出候选的错误
+- `src/render/Renderer.cpp`、`include/sim/Renderer.hpp`：`Renderer::Impl` 改用解析器；新增 `Renderer::shaderDirectory()` 返回实际使用的目录
+- `tests/shader_check.cpp`（新增，无 GPU）：解析顺序、显式/环境变量优先级、无效即报错且点名来源、路径归一化
+- `tests/package/CMakeLists.txt`、`tests/package/main.cpp`、`tests/package/check.cmake`（新增）：外部消费者只用 `find_package(SimRenderer)`；check.cmake 完成安装、安装树契约、包文件无源码/构建目录引用、无环境变量必须失败、环境变量指向前缀后成功渲染并核对深度与像素
+
+## 交接记录（历史）
 
 ### M5 修复 / F09（回应 REVIEW_M5：R-M5-001/002/003）
 

@@ -18,9 +18,33 @@ ctest --test-dir build -C Release --output-on-failure
 - `gallery --model path/to/asset.glb` 将静态不透明 glTF 模型放到展台上，也支持含外部缓冲和图片的 .gltf。
 - `gallery --capture image.png` 无窗口渲染并导出 PNG。可与 `--model` 组合。
 - `gallery --benchmark` 实测 1、4、8 个视图的批次耗时。每轮预热后统计 120 个批次，包含快照、录制、提交及最后一批 GPU 完成等待。
-- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单，`points_check --validation` 核对点云与网格的双向遮挡、强度/半径语义、相机姿态与双轴内参下的点尺寸，以及点云变化后 TAA 历史是否刷新、仅 Hdr 请求是否误推进历史基线，`observation_check --validation` 核对标定与投影一致、采样时刻、Beauty 与调试图同帧互不串色、真值通道独立于曝光与抖动、处理链无法覆盖真值。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断。validation 模式需要 SDK 验证层。
-- 仅编译引擎可传入 `-DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF`。嵌入其他程序时可用 `DeviceOptions::shaderDirectory` 指向生成的 SPIR-V 目录。当前 gallery 直接使用构建目录的着色器和源码目录的示例资产，移动可执行文件时需一并考虑这两个路径。
+- `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单，`points_check --validation` 核对点云与网格的双向遮挡、强度/半径语义、相机姿态与双轴内参下的点尺寸，以及点云变化后 TAA 历史是否刷新、仅 Hdr 请求是否误推进历史基线，`observation_check --validation` 核对标定与投影一致、采样时刻、Beauty 与调试图同帧互不串色、真值通道独立于曝光与抖动、处理链无法覆盖真值。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断；`shader_check` 同样不需要设备，检查着色器目录的解析顺序与失败诊断；`package_check` 由 CTest 驱动，把当前构建安装到全新前缀、核对安装树契约，再让一个只认 `find_package` 的外部项目构建并离屏渲染（见下节）。validation 模式需要 SDK 验证层。
+- 仅编译引擎可传入 `-DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF`。gallery 在构建树里靠可执行文件相对路径找到着色器，示例资产仍来自源码目录；安装与外部消费见下节。
 - `python tools/pngdiff.py a.png b.png` 统计两张 PNG 的差异字节数、最大与平均通道差，用于核对捕获画面是否只差舍入。
+
+## 安装与消费
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_INSTALL_PREFIX=C:/libs/sim-renderer
+cmake --build build --config Release
+cmake --install build --config Release
+```
+
+安装树自包含：`include/sim` 公共头文件、`include/glm`（glm 是公共头文件里的类型，随包安装）、`lib/renderer.lib`、`share/sim/shaders/*.spv` 与 `lib/cmake/SimRenderer`。外部项目只需要：
+
+```cmake
+find_package(SimRenderer 0.1 REQUIRED)
+target_link_libraries(app PRIVATE sim::renderer)
+```
+
+包配置只请求 `find_dependency(Vulkan 1.3)`——着色器已预编译为 SPIR-V，消费者不需要 glslc。着色器目录按以下顺序解析，取第一个含 `geometry.vert.spv` 的：
+
+1. `DeviceOptions::shaderDirectory`——显式指定，设了就必须有效，否则报错；
+2. 环境变量 `SIM_SHADER_DIR`——同上；
+3. 可执行文件相邻的常见布局：`<exe>/shaders`、`<exe>/../share/sim/shaders`、`<exe>/../shaders`、`<exe>/share/sim/shaders`——构建树和"应用装进同一前缀"都靠它命中；
+4. 编译进二进制的安装目录（配置本项目时的 `CMAKE_INSTALL_PREFIX`）。
+
+按配置前缀安装即可直接使用；用 `cmake --install --prefix` 装到别的位置时，设置第 1 或第 2 项。`Renderer::shaderDirectory()` 返回实际使用的目录，排查问题时先看它。
 
 ## 特性清单
 
@@ -37,6 +61,7 @@ ctest --test-dir build -C Release --output-on-failure
 | 传感器 | 按像素指定 fx/fy/cx/cy，GPU 附件访问，可选异步 RGBA8、米制 Z 和 uint32 实例 ID 批量读回，帧携带仿真时间。`observe()` 在同一次提交上另返回标定、采样时间与通道语义，投影由标定反算且与渲染器逐元素一致；处理链只能新增派生输出 |
 | 呈现 | 调试通道不进入光照：`lighting.frag` 只输出 Beauty，调试图由独立的 `presentation` pass 写单独图像，因此同一帧的 Beauty 与调试视图互不串色，HDR 与时序历史里只有 Beauty |
 | 导入与示例 | 静态 glTF/GLB 节点、索引、UV0、核心 PBR 贴图，外部或 GLB 内嵌 PNG/JPEG。交互展厅、七种几何体、轨道相机、光照及 G-buffer 预览（窗口采样调试图而非覆盖 Beauty） |
+| 安装与分发 | `cmake --install` 产出自包含前缀：公共头文件、随包安装的 glm、静态库、预编译 SPIR-V 与 CMake 包文件；`find_package(SimRenderer)` 导出 `sim::renderer`，消费者不需要 glslc；shader 目录运行时解析，二进制不指向源码/构建目录 |
 
 ## 最小离屏采集
 

@@ -84,6 +84,23 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 - 处理链是"只能新增"的协议：`SensorStage::outputs()` 声明本阶段新增的派生输出，`SensorStage::process(DerivedSink&)` 只通过 `sink.input()` 读观测、`sink.write(name)` 取自己声明的输出。`write()` 返回 `DerivedPixels`——**描述只读、像素可写**——名字、格式与尺寸由处理链按声明分配，阶段改不到，所以"声明了 A 却交付成 B"在类型上就不成立（`tests/observation_check.cpp` 用 `static_assert` 锁住返回类型）。`ProcessingChain::run` 在执行任何阶段之前做全链校验：空名、零尺寸、`desc.name == Observation::semantic(channel).name`（会遮蔽输入通道）、全链重名，任一命中就整体拒绝，不留半成品输出。行跨度与总长按 64 位计算并检查 `row > UINT32_MAX`：接口里的 `rowBytes` 是 `uint32_t`，按 32 位相乘会让巨大宽度回绕成很小的数，分配出的缓冲比声明的小、阶段按声明去写就越界。阶段全部返回后再复核一遍描述、行跨度与数据长度仍与声明一致。`ProcessedObservation` 同时持有源观测和派生输出，调用方读派生数据时源结果仍然有效。
 - 未实现的阶段（畸变、曝光积分、运动模糊、噪声）按同一协议接入，不改变上述约束；它们目前都是缺项，不列为已支持。
 
+## 安装与分发
+
+安装树的契约：`include/sim` 公共头文件、`include/glm`（glm 是公共头文件直接暴露的类型，作为接口目标随包安装，消费侧不能与另一份 glm 混用包含路径）、静态库、按本轮产物清单安装的 SPIR-V（不整装目录，避免把改名前的旧文件带出去）、`lib/cmake/SimRenderer` 的 config/version/targets。导出目标是 `sim::renderer`，`INTERFACE_LINK_LIBRARIES` 里的 `Vulkan::Vulkan` 由包配置的 `find_dependency(Vulkan 1.3)` 提供；不请求 glslc 组件——着色器在构建本库时已经编译，消费者只需要头文件与加载库。示例的 GLFW 强制 `GLFW_INSTALL=OFF`，否则它自己的 install 规则会把 GLFW 头文件与 cmake/pkg-config 配置混进前缀。
+
+shader 目录解析是这一节的核心约束：**二进制不得依赖源码或构建目录寻找 shader**。编译期默认目录是配置时的安装前缀（`${CMAKE_INSTALL_FULL_DATADIR}/sim/shaders`），运行时按四级解析：
+
+1. `DeviceOptions::shaderDirectory`——调用方的意图，必须含探测文件 `geometry.vert.spv`，无效直接报错；
+2. 环境变量 `SIM_SHADER_DIR`——同上；
+3. 可执行文件相邻布局（`<exe>/shaders`、`<exe>/../share/sim/shaders`、`<exe>/../shaders`、`<exe>/share/sim/shaders`）——前两级是搜索，取第一个含探测文件的；
+4. 编译期安装目录。
+
+设计取舍：前两级是"意图"，错了就失败而不是悄悄换一套着色器出图；后两级是"搜索"，构建树的可执行文件靠第 3 级命中 `build/shaders`（多配置生成器在 `<build>/Release` 下、单配置在 `<build>` 下），安装后的库靠第 4 级。探测文件而不是目录存在性判断，是为了跳过残留的空目录或半删的安装。全部落空时抛出列出全部候选的错误，并提示三种修正手段；`Renderer::shaderDirectory()` 返回实际使用的目录。
+
+用 `cmake --install --prefix` 装到与配置不同的前缀时第 4 级失效——这是接受的边界，不是缺陷：静态库没有可靠的"自身位置"可查，要么显式给目录，要么把应用装进同一前缀布局。诊断文本列出候选路径，包配置导出 `SimRenderer_SHADER_DIR` 供这种场景使用。
+
+覆盖由两个测试承担，各自守不同的失败面。`shader_check`（无 GPU）锁解析顺序、显式/环境变量优先级、无效即报错且点名来源、路径归一化。`package_check`（CTest 脚本）做端到端：装到全新前缀 → 断言安装树契约（头文件、glm、库、全套 SPIR-V，GLSL 源码不得进入）→ 断言包文件不含源码或构建目录引用 → 用只认 `find_package` 的外部项目构建 → 验证**不设环境变量时必须失败**且诊断点名配置的安装目录（这条堵住"默认解析悄悄回落到构建目录"的回归）→ 设 `SIM_SHADER_DIR` 指向前缀后渲染成功、shader 目录在前缀之下、中心深度与像素数符合预期。四处缺陷注入（不装 SPIR-V、不装 glm、导出命名空间写错、默认目录改回构建目录）分别被对应断言捕获。
+
 ## 验证与性能
 
 每阶段运行现有回归和相关 Vulkan validation。图像质量用数值参考和人工检查；性能记录设备/驱动、分辨率、场景、相机数、预热/样本数、CPU/GPU 时间、显存和读回设置。测试契约和失败路径，不复制实现细节作为断言。

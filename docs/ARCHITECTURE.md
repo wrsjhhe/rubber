@@ -19,8 +19,9 @@
 | src/sensors | 校准、观测元数据与处理链 | 改写原始真值 |
 | src/presentation | 调试输出、显示转换 | 改写其他消费者的颜色 |
 | example | GLFW/ImGui 应用和资产 | 成为核心库必需依赖 |
+| cmake/、tests/package | 安装规则、CMake 包配置、外部消费者检查 | 把构建目录或源码路径写进安装产物 |
 
-无需提前创建空目录。Scene 的 mesh 专用字段通过兼容适配逐步迁移；点云不能被要求伪装成三角网格。截至 M5，`src/render/graph`、`src/render/passes`、`src/modules`、`src/sensors` 与 `src/presentation` 都已按表中职责存在：帧图只做声明、裁剪、依赖与屏障推导，不接触材质或点云语义；每个 pass 只录制自己的绘制，不隐式转换未声明的资源；`src/modules/mesh` 与 `src/modules/points` 是并列注册的模块，主调度只遍历 `RenderModule`/`ModuleView` 接口，没有类型分支；`src/sensors` 只产出标定、采样语义与处理链结果，观测对象对 `FrameResult` 只读、处理链只能新增派生输出，两者都无法改写真值；`src/presentation` 只写自己的调试图像，与 Beauty/HDR 是并列的消费者而不是覆盖者。三个方向都不允许反向依赖：`src/render` 不因调试呈现改变光照输出，`src/sensors` 不进入录制路径。
+无需提前创建空目录。Scene 的 mesh 专用字段通过兼容适配逐步迁移；点云不能被要求伪装成三角网格。截至 M6，`src/render/graph`、`src/render/passes`、`src/modules`、`src/sensors`、`src/presentation` 与安装/导出都已按表中职责存在：帧图只做声明、裁剪、依赖与屏障推导，不接触材质或点云语义；每个 pass 只录制自己的绘制，不隐式转换未声明的资源；`src/modules/mesh` 与 `src/modules/points` 是并列注册的模块，主调度只遍历 `RenderModule`/`ModuleView` 接口，没有类型分支；`src/sensors` 只产出标定、采样语义与处理链结果，观测对象对 `FrameResult` 只读、处理链只能新增派生输出，两者都无法改写真值；`src/presentation` 只写自己的调试图像，与 Beauty/HDR 是并列的消费者而不是覆盖者；`cmake/SimRendererConfig.cmake.in` 与 `src/render/ShaderDirectory` 让安装前缀自包含，二进制不携带源码/构建目录的 shader 路径。这些方向都不允许反向依赖：`src/render` 不因调试呈现改变光照输出，`src/sensors` 不进入录制路径，安装规则不因示例的存在而多装 GLFW 的产物。
 
 ## 所有权
 
@@ -45,6 +46,6 @@
 
 ## 迁移顺序
 
-共享场景 → 帧图/pass → 网格模块化与点云验证 → 观测/呈现分离 → 安装消费。每阶段保持 Gallery 和现有测试工作。公开 API 变更需迁移示例；旧 render/read 保留最近帧语义，新接口提供保活结果。
+共享场景 → 帧图/pass → 网格模块化与点云验证 → 观测/呈现分离 → 安装消费（已完成：安装树自包含、`find_package` 消费、shader 目录运行时解析）。每阶段保持 Gallery 和现有测试工作。公开 API 变更需迁移示例；旧 render/read 保留最近帧语义，新接口提供保活结果。
 
 当前 Renderer.hpp 仍含 Vulkan 类型，新增互操作头不代表公开接口已后端无关。目标目录也不代表功能已经实现。
