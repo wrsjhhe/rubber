@@ -62,6 +62,10 @@ target_include_directories(renderer
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE ${stb_SOURCE_DIR} third_party/cgltf)
 target_link_libraries(renderer PUBLIC Vulkan::Vulkan sim_glm)
+# 公开头直接暴露 C++20 接口（std::optional、std::span、观测/处理链的返回类型）。
+# 语言要求必须作为 PUBLIC 编译特性随导出 target 传播：消费者只 find_package + 链接
+# sim::renderer 就得到正确的标准，不依赖消费者自己设置 CMAKE_CXX_STANDARD。
+target_compile_features(renderer PUBLIC cxx_std_20)
 # 二进制里的默认着色器目录指向安装位置，而不是源码或构建目录：安装后的库应当在自己的
 # 安装前缀下找到 SPIR-V。构建树里的可执行文件由 exe 相对路径命中（见 ShaderDirectory.cpp），
 # 因此同一份二进制在两种布局下都工作，且不含构建目录路径。
@@ -114,7 +118,8 @@ if(BUILD_TESTING)
       "-DGeneratorPlatform=${CMAKE_GENERATOR_PLATFORM}"
       "-DConfiguredShaderDir=${RENDERER_SHADER_INSTALL_DIR}"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/package/check.cmake")
-  set_tests_properties(package_check PROPERTIES TIMEOUT 900)
+  # 含一次隔离构建（引擎本体 + 两个外部消费者），给足时间。
+  set_tests_properties(package_check PROPERTIES TIMEOUT 1800)
 endif()
 if(RENDERER_INSTALL)
   install(TARGETS renderer sim_glm EXPORT SimRendererTargets
