@@ -47,8 +47,8 @@ struct Import
         std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> p(
             stbi_load_from_memory(cgltf_buffer_view_data(bv), int(bv->size), &w, &h, &c, 4), stbi_image_free);
         require(bool(p), "Cannot decode embedded texture");
-        return images[img] = std::make_shared<Texture>(
-                   Texture{uint32_t(w), uint32_t(h), {p.get(), p.get() + size_t(w) * h * 4}});
+        return images[img] = std::make_shared<Texture>(uint32_t(w), uint32_t(h),
+                                                       std::vector<uint8_t>(p.get(), p.get() + size_t(w) * h * 4));
     }
     std::shared_ptr<const MeshStandardMaterial> material(const cgltf_material* src)
     {

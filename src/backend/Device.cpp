@@ -50,12 +50,17 @@ void Device::init(const DeviceOptions& options)
     check(vkEnumeratePhysicalDevices(instance, &count, devices.data()), "enumerate GPUs");
     for (auto gpu : devices)
     {
-        VkPhysicalDeviceVulkan13Features features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceVulkan12Features features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceVulkan13Features features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                                  &features12};
         VkPhysicalDeviceFeatures2 f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &features};
         vkGetPhysicalDeviceFeatures2(gpu, &f);
         vkGetPhysicalDeviceProperties(gpu, &properties);
+        // 点云用 discard 裁出圆盘，并在同一管线里对 HDR 混合、对其余附件不混合，
+        // 因此需要着色器终止与独立混合两项特性。
         if (properties.apiVersion < VK_API_VERSION_1_3 || !features.dynamicRendering ||
-            properties.limits.maxColorAttachments < 5)
+            !features12.timelineSemaphore || !features.shaderDemoteToHelperInvocation ||
+            !f.features.independentBlend || properties.limits.maxColorAttachments < 6)
             continue;
         vkGetPhysicalDeviceQueueFamilyProperties(gpu, &count, nullptr);
         std::vector<VkQueueFamilyProperties> families(count);
@@ -77,15 +82,22 @@ void Device::init(const DeviceOptions& options)
             break;
     }
     if (!physical)
-        throw std::runtime_error("Requires Vulkan 1.3 dynamic rendering and five MRTs");
+        throw std::runtime_error(
+            "Requires Vulkan 1.3 dynamic rendering, timeline semaphore, independent blend and six MRTs");
     float priority = 1;
     VkDeviceQueueCreateInfo qc{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qc.queueFamilyIndex = family;
     qc.queueCount = 1;
     qc.pQueuePriorities = &priority;
-    VkPhysicalDeviceVulkan13Features f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12.timelineSemaphore = VK_TRUE;
+    VkPhysicalDeviceVulkan13Features f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &f12};
     f.dynamicRendering = VK_TRUE;
-    VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f};
+    f.shaderDemoteToHelperInvocation = VK_TRUE;
+    // independentBlend 属于核心特性，单独挂一层 Features2。
+    VkPhysicalDeviceFeatures2 core{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f};
+    core.features.independentBlend = VK_TRUE;
+    VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &core};
     dc.queueCreateInfoCount = 1;
     dc.pQueueCreateInfos = &qc;
     const char* swap = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
@@ -97,6 +109,11 @@ void Device::init(const DeviceOptions& options)
     check(vkCreateDevice(physical, &dc, nullptr, &device), "create device");
     lifetime.release.push_back([this] { vkDestroyDevice(device, nullptr); });
     vkGetDeviceQueue(device, family, 0, &queue);
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+    check(vkCreateSemaphore(device, &semaphore, nullptr, &uploadTimeline), "upload timeline");
+    lifetime.release.push_back([this] { vkDestroySemaphore(device, uploadTimeline, nullptr); });
     VkCommandPoolCreateInfo pc{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pc.queueFamilyIndex = family;
     pc.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -234,104 +251,133 @@ VkCommandBuffer Device::command() const
     check(vkAllocateCommandBuffers(device, &a, &cmd), "allocate command buffer");
     return cmd;
 }
-void Device::immediate(const std::function<void(VkCommandBuffer)>& record) const
+uint64_t Device::nextUploadSignal()
 {
-    auto cmd = command();
-    Lifetime life;
-    life.release.push_back([&] { vkFreeCommandBuffers(device, pool, 1, &cmd); });
-    VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    b.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    check(vkBeginCommandBuffer(cmd, &b), "begin upload");
-    record(cmd);
-    check(vkEndCommandBuffer(cmd), "end upload");
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    VkFence fence;
-    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    check(vkCreateFence(device, &fi, nullptr, &fence), "upload fence");
-    life.release.push_back([this, fence] { vkDestroyFence(device, fence, nullptr); });
-    check(vkQueueSubmit(queue, 1, &si, fence), "submit upload");
-    check(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX), "wait upload");
+    return ++uploadValue;
 }
-Buf Device::upload(const void* data, size_t bytes, VkBufferUsageFlags usage) const
+UploadBatch::UploadBatch(Device& device) : d(device)
 {
-    auto staging = buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-    std::memcpy(staging->mapped, data, bytes);
-    auto result = buffer(bytes, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
-    immediate(
-        [&](auto cmd)
-        {
-            VkBufferCopy copy{0, 0, bytes};
-            vkCmdCopyBuffer(cmd, staging->handle, result->handle, 1, &copy);
-            VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1,
-                                 &barrier, 0, nullptr, 0, nullptr);
-        });
+    cmd = d.command();
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(cmd, &begin), "begin upload batch");
+    recording = true;
+}
+UploadBatch::~UploadBatch()
+{
+    if (recording)
+        vkEndCommandBuffer(cmd);
+    wait();
+    vkFreeCommandBuffers(d.device, d.pool, 1, &cmd);
+}
+bool UploadBatch::complete() const
+{
+    return !fence || vkGetFenceStatus(d.device, fence) == VK_SUCCESS;
+}
+uint64_t UploadBatch::stagingBytes() const
+{
+    uint64_t bytes = 0;
+    for (auto& source : staging)
+        bytes += source->size;
+    return bytes;
+}
+void UploadBatch::wait()
+{
+    if (!fence)
+        return;
+    check(vkWaitForFences(d.device, 1, &fence, VK_TRUE, UINT64_MAX), "wait for uploads");
+    vkDestroyFence(d.device, fence, nullptr);
+    fence = {};
+    staging.clear();
+}
+uint64_t UploadBatch::submit()
+{
+    check(vkEndCommandBuffer(cmd), "end upload batch");
+    recording = false;
+    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    check(vkCreateFence(d.device, &fenceInfo, nullptr, &fence), "upload fence");
+    auto value = d.nextUploadSignal();
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timeline.signalSemaphoreValueCount = 1;
+    timeline.pSignalSemaphoreValues = &value;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO, &timeline};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = &d.uploadTimeline;
+    check(vkQueueSubmit(d.queue, 1, &submit, fence), "submit upload batch");
+    signal = value;
+    return value;
+}
+Buf UploadBatch::upload(const void* data, size_t bytes, VkBufferUsageFlags usage)
+{
+    auto source = d.buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    std::memcpy(source->mapped, data, bytes);
+    auto result = d.buffer(bytes, usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+    VkBufferCopy copy{0, 0, bytes};
+    vkCmdCopyBuffer(cmd, source->handle, result->handle, 1, &copy);
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &barrier,
+                         0, nullptr, 0, nullptr);
+    staging.push_back(std::move(source));
     return result;
 }
-Img Device::texture(const Texture& t, bool srgb) const
+Img UploadBatch::texture(const Texture& t, bool srgb)
 {
     if (!t.width || !t.height || uint64_t(t.width) * t.height != t.rgba.size() / 4 || t.rgba.size() % 4)
         throw std::invalid_argument("Invalid texture size");
-    auto staging = buffer(t.rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
-    std::memcpy(staging->mapped, t.rgba.data(), t.rgba.size());
+    auto source = d.buffer(t.rgba.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    std::memcpy(source->mapped, t.rgba.data(), t.rgba.size());
     auto format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
     VkFormatProperties properties{};
-    vkGetPhysicalDeviceFormatProperties(physical, format, &properties);
+    vkGetPhysicalDeviceFormatProperties(d.physical, format, &properties);
     constexpr auto required = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
                               VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
     auto levels = (properties.optimalTilingFeatures & required) == required
                       ? std::bit_width(std::max(t.width, t.height))
                       : 1u;
-    auto img = image(
+    auto img = d.image(
         t.width, t.height, format,
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, levels);
-    immediate(
-        [&](auto cmd)
-        {
-            img->transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            VkBufferImageCopy c{};
-            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            c.imageExtent = {t.width, t.height, 1};
-            vkCmdCopyBufferToImage(cmd, staging->handle, img->handle, img->layout, 1, &c);
-            // 每一层在成为下一次缩小采样的来源前，单独转换布局。
-            auto transitionLevel = [&](uint32_t level, VkImageLayout oldLayout, VkImageLayout next)
-            {
-                auto src = access(oldLayout), dst = access(next);
-                VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                barrier.srcAccessMask = src.access;
-                barrier.dstAccessMask = dst.access;
-                barrier.oldLayout = oldLayout;
-                barrier.newLayout = next;
-                barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                barrier.image = img->handle;
-                barrier.subresourceRange = {img->aspect, level, 1, 0, 1};
-                vkCmdPipelineBarrier(cmd, src.stage, dst.stage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-            };
-            int w = int(t.width), h = int(t.height);
-            for (uint32_t level = 1; level < levels; ++level)
-            {
-                transitionLevel(level - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-                VkImageBlit region{};
-                region.srcSubresource = {img->aspect, level - 1, 0, 1};
-                region.srcOffsets[1] = {w, h, 1};
-                w = std::max(1, w / 2);
-                h = std::max(1, h / 2);
-                region.dstSubresource = {img->aspect, level, 0, 1};
-                region.dstOffsets[1] = {w, h, 1};
-                vkCmdBlitImage(cmd, img->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img->handle,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
-                transitionLevel(level - 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            }
-            transitionLevel(levels - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        });
+    img->transition(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {t.width, t.height, 1};
+    vkCmdCopyBufferToImage(cmd, source->handle, img->handle, img->layout, 1, &copy);
+    // 每一层在成为下一次缩小采样的来源前，单独转换布局。
+    auto transitionLevel = [&](uint32_t level, VkImageLayout oldLayout, VkImageLayout next)
+    {
+        auto src = access(oldLayout), dst = access(next);
+        VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        barrier.srcAccessMask = src.access;
+        barrier.dstAccessMask = dst.access;
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = next;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = img->handle;
+        barrier.subresourceRange = {img->aspect, level, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, src.stage, dst.stage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    };
+    int w = int(t.width), h = int(t.height);
+    for (uint32_t level = 1; level < levels; ++level)
+    {
+        transitionLevel(level - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        VkImageBlit region{};
+        region.srcSubresource = {img->aspect, level - 1, 0, 1};
+        region.srcOffsets[1] = {w, h, 1};
+        w = std::max(1, w / 2);
+        h = std::max(1, h / 2);
+        region.dstSubresource = {img->aspect, level, 0, 1};
+        region.dstOffsets[1] = {w, h, 1};
+        vkCmdBlitImage(cmd, img->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img->handle,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+        transitionLevel(level - 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    transitionLevel(levels - 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    img->layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    staging.push_back(std::move(source));
     return img;
 }
 }

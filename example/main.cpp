@@ -265,11 +265,16 @@ int gallery(int argc, char** argv)
     VkDescriptorSet image{};
     RenderOptions render;
     int sceneIndex = 0, frames = 0;
+    int imageChannel = 0;
     bool orbit = false;
     float sunlight = 1;
     while (!glfwWindowShouldClose(window.get()) && (!smoke || frames < 12))
     {
         glfwPollEvents();
+        if (smoke && frames == 3)
+            render.debugChannel = 3;
+        if (smoke && frames == 5)
+            render.debugChannel = 0;
         if (smoke && frames == 6)
         {
             glfwSetWindowSize(window.get(), 1080, 680);
@@ -297,18 +302,25 @@ int gallery(int argc, char** argv)
         int available = std::max(1, fw - left);
         int width = std::min(available, std::max(1, int(std::round(fh * 1.6))));
         int height = std::clamp(int(std::round(width / 1.6)), 1, fh);
-        if (width != viewWidth || height != viewHeight)
+        if (width != viewWidth || height != viewHeight || render.debugChannel != imageChannel)
         {
             if (image)
             {
                 check(vkDeviceWaitIdle(renderer.handles().device));
                 ImGui_ImplVulkan_RemoveTexture(image);
             }
-            view = renderer.createView(width, height);
-            image = ImGui_ImplVulkan_AddTexture(renderer.displaySampler(), view->colorView(),
+            if (width != viewWidth || height != viewHeight)
+            {
+                view = renderer.createView(width, height);
+                viewWidth = width;
+                viewHeight = height;
+            }
+            imageChannel = render.debugChannel;
+            // 窗口只消费输出：Beauty 与调试图是两张图，选择调试通道时换采样目标，
+            // 而不是让调试覆盖同帧的真实颜色。
+            image = ImGui_ImplVulkan_AddTexture(renderer.displaySampler(),
+                                                imageChannel ? view->debugView() : view->colorView(),
                                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            viewWidth = width;
-            viewHeight = height;
         }
         ImGui::SetNextWindowPos({0, 0});
         ImGui::SetNextWindowSize({panel, io.DisplaySize.y});

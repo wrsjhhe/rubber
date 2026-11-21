@@ -30,6 +30,6 @@ void main() {
     depthMetres = 1/gl_FragCoord.w;
     vec2 currentUV = gl_FragCoord.xy * frame.info.yz;
     if (draw.stable == 0) currentUV -= frame.jitter.xy * 0.5;
-    motion = vec4(oldClip.xy/max(oldClip.w,1e-5)*0.5+0.5-currentUV,oldClip.w,m.label.y);
+    motion = vec4(oldClip.xy/max(oldClip.w,1e-5)*0.5+0.5-currentUV,oldClip.w,histories.data[draw.object].label.y);
     instanceID = m.label.x;
 }

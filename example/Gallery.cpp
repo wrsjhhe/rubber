@@ -21,11 +21,10 @@ glm::mat4 transform(glm::vec3 p, glm::vec3 scale)
 {
     return glm::scale(glm::translate(glm::mat4(1), p), scale);
 }
-std::shared_ptr<Texture> tiles()
+std::shared_ptr<const Texture> tiles()
 {
     constexpr int size = 256;
-    auto texture = std::make_shared<Texture>(Texture{size, size, {}});
-    texture->rgba.resize(size * size * 4);
+    std::vector<uint8_t> pixels(size * size * 4);
     for (int y = 0; y < size; ++y)
         for (int x = 0; x < size; ++x)
         {
@@ -41,10 +40,10 @@ std::shared_ptr<Texture> tiles()
             if (std::abs(diamond - .28f) < .008f || std::abs(diamond - .77f) < .012f)
                 c = {127, 111, 92};
             for (int k = 0; k < 3; ++k)
-                texture->rgba[(y * size + x) * 4 + k] = uint8_t(c[k] + grain);
-            texture->rgba[(y * size + x) * 4 + 3] = 255;
+                pixels[(y * size + x) * 4 + k] = uint8_t(c[k] + grain);
+            pixels[(y * size + x) * 4 + 3] = 255;
         }
-    return texture;
+    return std::make_shared<Texture>(size, size, std::move(pixels));
 }
 // 拱券由独立楔形石组成，侧、顶和拱腹均有真实轮廓。
 Geometry voussoir(float start, float end, float r, float width, float depth)
@@ -98,16 +97,17 @@ Scene courtyard(const std::filesystem::path& asset)
     auto plaster = surface({.7f, .48f, .28f}), trim = surface({.78f, .64f, .47f}),
          dark = surface({.034f, .095f, .09f});
     auto brass = surface({.63f, .39f, .15f}, .29f, .8f);
-    auto limestone = std::make_shared<Texture>(Texture{256, 256, {}});
-    limestone->rgba.reserve(256 * 256 * 4);
+    std::vector<uint8_t> grainPixels;
+    grainPixels.reserve(256 * 256 * 4);
     for (int y = 0; y < 256; ++y)
         for (int x = 0; x < 256; ++x)
         {
             float grain = std::sin(x * 71.3f + y * 32.1f) * std::sin(y * .8f + x * .5f);
             float vein = std::sin(y * .095f + std::sin(x * .05f) + std::sin(y * .12f + x * .04f) * .7f);
             auto shade = uint8_t(229 + grain * 7 + vein * 5 - std::pow(std::max(0.f, vein), 20.f) * 10);
-            limestone->rgba.insert(limestone->rgba.end(), {shade, shade, shade, 255});
+            grainPixels.insert(grainPixels.end(), {shade, shade, shade, 255});
         }
+    auto limestone = std::make_shared<Texture>(256, 256, std::move(grainPixels));
     plaster->map = trim->map = limestone;
     auto stone = surface({.37f, .28f, .20f});
     auto floor = surface({.81f, .78f, .74f});

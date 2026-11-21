@@ -2,6 +2,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/constants.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -13,6 +14,13 @@
 
 namespace sim
 {
+AssetId nextAssetId()
+{
+    // 身份只需在本进程内唯一：缓存代际与身份都不跨进程，因此计数器从零开始，
+    // 也不可能因为对象释放而回退到曾被使用的值。
+    static std::atomic<AssetId> counter{0};
+    return ++counter;
+}
 namespace
 {
 void require(bool ok, const char* message)
@@ -56,23 +64,77 @@ Geometry lathe(const std::vector<Ring>& rings, unsigned segments)
     return TriangleMeshGeometry(std::move(v), std::move(idx));
 }
 }
-BufferGeometry::BufferGeometry(std::vector<Vertex> v, std::vector<uint32_t> i)
-    : vertices(std::move(v)), indices(std::move(i))
+// 包围盒与几何内容一起在构造时算定：它是渲染侧剔除和阴影范围的输入，
+// 与顶点同等属于不可变内容，不能由调用方在发布后修改。
+struct BufferGeometry::Baked
 {
-    require(!vertices.empty() && !indices.empty() && indices.size() % 3 == 0, "Expected indexed triangles");
-    minimum = maximum = vertices.front().position;
-    for (auto& vertex : vertices)
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    glm::vec3 minimum{}, maximum{};
+};
+BufferGeometry::Baked BufferGeometry::bake(std::vector<Vertex> v, std::vector<uint32_t> i)
+{
+    require(!v.empty() && !i.empty() && i.size() % 3 == 0, "Expected indexed triangles");
+    Baked baked{std::move(v), std::move(i)};
+    baked.minimum = baked.maximum = baked.vertices.front().position;
+    for (auto& vertex : baked.vertices)
     {
         require(finite(vertex.position) && finite(vertex.normal), "Non-finite vertex");
-        minimum = glm::min(minimum, vertex.position);
-        maximum = glm::max(maximum, vertex.position);
+        baked.minimum = glm::min(baked.minimum, vertex.position);
+        baked.maximum = glm::max(baked.maximum, vertex.position);
     }
-    for (auto index : indices)
-        require(index < vertices.size(), "Index outside mesh");
+    for (auto index : baked.indices)
+        require(index < baked.vertices.size(), "Index outside mesh");
+    return baked;
+}
+BufferGeometry::BufferGeometry(std::vector<Vertex> v, std::vector<uint32_t> i)
+    : BufferGeometry(bake(std::move(v), std::move(i)))
+{
+}
+BufferGeometry::BufferGeometry(Baked&& baked)
+    : vertices(std::move(baked.vertices)), indices(std::move(baked.indices)), minimum(baked.minimum),
+      maximum(baked.maximum)
+{
 }
 Geometry TriangleMeshGeometry(std::vector<Vertex> v, std::vector<uint32_t> i)
 {
     return std::make_shared<BufferGeometry>(std::move(v), std::move(i));
+}
+// 点云与几何同构：内容、包围盒与最大半径在构造时一次算定，之后全部只读。
+struct BufferPointCloud::Baked
+{
+    std::vector<PointVertex> points;
+    glm::vec3 minimum{}, maximum{};
+    float maxRadius = 0;
+};
+BufferPointCloud::Baked BufferPointCloud::bake(std::vector<PointVertex> points)
+{
+    require(!points.empty(), "Expected at least one point");
+    Baked baked;
+    baked.points = std::move(points);
+    baked.minimum = baked.maximum = baked.points.front().position;
+    for (auto& point : baked.points)
+    {
+        require(finite(point.position) && finite(point.color), "Non-finite point");
+        require(std::isfinite(point.intensity) && point.intensity >= 0, "Invalid point intensity");
+        require(std::isfinite(point.radius) && point.radius > 0, "Invalid point radius");
+        baked.minimum = glm::min(baked.minimum, point.position);
+        baked.maximum = glm::max(baked.maximum, point.position);
+        // 剔除与投影都按球体处理，包围盒与像素尺寸都要带上最大半径。
+        baked.maxRadius = std::max(baked.maxRadius, point.radius);
+    }
+    baked.minimum -= glm::vec3(baked.maxRadius);
+    baked.maximum += glm::vec3(baked.maxRadius);
+    return baked;
+}
+BufferPointCloud::BufferPointCloud(std::vector<PointVertex> points)
+    : BufferPointCloud(bake(std::move(points)))
+{
+}
+BufferPointCloud::BufferPointCloud(Baked&& baked)
+    : points(std::move(baked.points)), minimum(baked.minimum), maximum(baked.maximum),
+      maxRadius(baked.maxRadius)
+{
 }
 Geometry BoxGeometry(float w, float h, float d)
 {
@@ -200,6 +262,11 @@ Geometry ConvexGeometry(const std::vector<glm::vec3>& p)
     }
     return TriangleMeshGeometry(std::move(v), std::move(idx));
 }
+Texture::Texture(uint32_t w, uint32_t h, std::vector<uint8_t> pixels)
+    : width(w), height(h), rgba(std::move(pixels))
+{
+    require(w && h && uint64_t(w) * h * 4 == rgba.size(), "Texture size does not match pixel data");
+}
 std::shared_ptr<const Texture> Texture::load(const std::filesystem::path& path)
 {
     int w, h, channels;
@@ -207,8 +274,8 @@ std::shared_ptr<const Texture> Texture::load(const std::filesystem::path& path)
         stbi_load(path.string().c_str(), &w, &h, &channels, 4), stbi_image_free);
     if (!pixels)
         throw std::runtime_error("Cannot load texture: " + path.string());
-    return std::make_shared<Texture>(
-        Texture{uint32_t(w), uint32_t(h), {pixels.get(), pixels.get() + size_t(w) * h * 4}});
+    return std::make_shared<Texture>(uint32_t(w), uint32_t(h),
+                                     std::vector<uint8_t>(pixels.get(), pixels.get() + size_t(w) * h * 4));
 }
 uint32_t Scene::addGroup(glm::mat4 local, uint32_t parent)
 {
@@ -226,9 +293,21 @@ uint32_t Scene::add(Geometry geometry, std::shared_ptr<const MeshStandardMateria
                     uint32_t parent)
 {
     require(geometry && material, "Invalid mesh");
+    return add(std::move(geometry), *material, local, parent);
+}
+uint32_t Scene::add(Geometry geometry, const MeshStandardMaterial& material, glm::mat4 local, uint32_t parent)
+{
+    require(bool(geometry), "Invalid mesh");
     auto id = addGroup(local, parent);
     nodes.back().geometry = std::move(geometry);
-    nodes.back().material = std::move(material);
+    nodes.back().material = material;
+    return id;
+}
+uint32_t Scene::addPoints(PointCloud cloud, glm::mat4 local, uint32_t parent)
+{
+    require(bool(cloud), "Invalid point cloud");
+    auto id = addGroup(local, parent);
+    nodes.back().cloud = std::move(cloud);
     return id;
 }
 Object3D& Scene::get(uint32_t id)
@@ -251,7 +330,7 @@ void Scene::remove(uint32_t id)
 }
 SceneSnapshot Scene::snapshot(double t) const
 {
-    SceneSnapshot result{t, sun, lights, {}};
+    SceneSnapshot result{t, sun, lights, {}, {}};
     result.meshes.reserve(nodes.size());
     std::unordered_map<uint32_t, glm::mat4> transforms;
     for (auto& node : nodes)
@@ -260,6 +339,9 @@ SceneSnapshot Scene::snapshot(double t) const
         transforms.emplace(node.id(), world);
         if (node.geometry)
             result.meshes.push_back({node.id(), node.geometry, node.material, world, node.castsShadow});
+        // 点云节点与网格节点各自进入自己的列表，快照不改变两者的类型语义。
+        else if (node.cloud)
+            result.points.push_back({node.id(), node.cloud, world});
     }
     return result;
 }

@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+# 消费者只需要 Vulkan 的头文件与库。着色器是预编译好的 SPIR-V，构建本库时才需要 glslc，
+# 因此这里不请求 glslc 组件，避免要求消费者安装完整的着色器编译器。
+find_dependency(Vulkan 1.3)
+
+# 安装前缀下的着色器目录。默认解析顺序里已经把"配置时的安装前缀"编进二进制，这个变量供
+# 两种情况使用：用 --prefix 装到了别处（前缀与配置时不同），或调用方想显式指定。
+set(SimRenderer_SHADER_DIR "@PACKAGE_CMAKE_INSTALL_DATADIR@/sim/shaders")
+
+include("${CMAKE_CURRENT_LIST_DIR}/SimRendererTargets.cmake")
+
+check_required_components(SimRenderer)
