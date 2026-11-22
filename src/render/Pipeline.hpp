@@ -32,6 +32,9 @@ struct Pipelines
     VkDescriptorSetLayout frame{}, material{}, lighting{}, resolve{}, colorSet{}, points{}, presentationSet{};
     VkPipelineLayout meshLayout{}, lightLayout{}, resolveLayout{}, colorLayout{}, pointsLayout{}, presentationLayout{};
     VkPipeline shadow{}, geometry{}, shade{}, temporal{}, color{}, splat{}, splatDepth{}, presentation{};
+    VkDescriptorSetLayout rayLighting{};
+    VkPipelineLayout rayLightLayout{};
+    VkPipeline shadeRay{};
     VkSampler point{}, linear{}, repeat{};
     explicit Pipelines(Device&, const std::filesystem::path&);
 };

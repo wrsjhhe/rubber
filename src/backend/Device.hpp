@@ -75,6 +75,15 @@ struct Device : DeviceHandles
     Lifetime lifetime;
     VkCommandPool pool{};
     VkPhysicalDeviceProperties properties{};
+    bool rayQuery = false;
+    VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationLimits{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+    PFN_vkCreateAccelerationStructureKHR createAcceleration{};
+    PFN_vkDestroyAccelerationStructureKHR destroyAcceleration{};
+    PFN_vkGetAccelerationStructureBuildSizesKHR accelerationBuildSizes{};
+    PFN_vkCmdBuildAccelerationStructuresKHR buildAcceleration{};
+    PFN_vkGetAccelerationStructureDeviceAddressKHR accelerationAddress{};
+    VkDeviceAddress address(const Buffer&) const;
     // 上传完成时间线。每批上传递增一个值，帧提交等待对应值即建立提交依赖。
     VkSemaphore uploadTimeline{};
     uint64_t uploadValue = 0;

@@ -100,14 +100,63 @@ void Device::init(const DeviceOptions& options)
     VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &core};
     dc.queueCreateInfoCount = 1;
     dc.pQueueCreateInfos = &qc;
-    const char* swap = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    uint32_t extensionCount = 0;
+    check(vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, nullptr), "enumerate extensions");
+    std::vector<VkExtensionProperties> available(extensionCount);
+    check(vkEnumerateDeviceExtensionProperties(physical, nullptr, &extensionCount, available.data()), "read extensions");
+    constexpr const char* required[] = {VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+                                        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+                                        VK_KHR_RAY_QUERY_EXTENSION_NAME};
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR acceleration{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+    VkPhysicalDeviceRayQueryFeaturesKHR query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR, &acceleration};
+    std::vector<const char*> extensions;
     if (surface)
+        extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (!options.forceRasterShadows && std::ranges::all_of(required, [&](const char* name)
+        {
+            return std::ranges::any_of(available, [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+        }))
     {
-        dc.enabledExtensionCount = 1;
-        dc.ppEnabledExtensionNames = &swap;
+        VkPhysicalDeviceVulkan12Features supported12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &query};
+        VkPhysicalDeviceVulkan13Features supported13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, &supported12};
+        VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &supported13};
+        vkGetPhysicalDeviceFeatures2(physical, &supported);
+        VkFormatProperties vertexFormat{};
+        vkGetPhysicalDeviceFormatProperties(physical, VK_FORMAT_R32G32B32_SFLOAT, &vertexFormat);
+        rayQuery = supported12.bufferDeviceAddress && supported13.synchronization2 &&
+                   query.rayQuery && acceleration.accelerationStructure &&
+                   (vertexFormat.bufferFeatures & VK_FORMAT_FEATURE_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR);
     }
+    if (rayQuery)
+    {
+        extensions.insert(extensions.end(), std::begin(required), std::end(required));
+        f12.bufferDeviceAddress = VK_TRUE;
+        f12.pNext = &query;
+        f.synchronization2 = VK_TRUE;
+        acceleration = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
+        acceleration.accelerationStructure = VK_TRUE;
+        query.rayQuery = VK_TRUE;
+    }
+    dc.enabledExtensionCount = uint32_t(extensions.size());
+    dc.ppEnabledExtensionNames = extensions.data();
     check(vkCreateDevice(physical, &dc, nullptr, &device), "create device");
     lifetime.release.push_back([this] { vkDestroyDevice(device, nullptr); });
+    if (rayQuery)
+    {
+        createAcceleration = reinterpret_cast<PFN_vkCreateAccelerationStructureKHR>(
+            vkGetDeviceProcAddr(device, "vkCreateAccelerationStructureKHR"));
+        destroyAcceleration = reinterpret_cast<PFN_vkDestroyAccelerationStructureKHR>(
+            vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR"));
+        accelerationBuildSizes = reinterpret_cast<PFN_vkGetAccelerationStructureBuildSizesKHR>(
+            vkGetDeviceProcAddr(device, "vkGetAccelerationStructureBuildSizesKHR"));
+        buildAcceleration = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
+            vkGetDeviceProcAddr(device, "vkCmdBuildAccelerationStructuresKHR"));
+        accelerationAddress = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
+            vkGetDeviceProcAddr(device, "vkGetAccelerationStructureDeviceAddressKHR"));
+        VkPhysicalDeviceProperties2 extended{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &accelerationLimits};
+        vkGetPhysicalDeviceProperties2(physical, &extended);
+    }
     vkGetDeviceQueue(device, family, 0, &queue);
     VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -119,6 +168,12 @@ void Device::init(const DeviceOptions& options)
     pc.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     check(vkCreateCommandPool(device, &pc, nullptr, &pool), "create command pool");
     lifetime.release.push_back([this] { vkDestroyCommandPool(device, pool, nullptr); });
+}
+VkDeviceAddress Device::address(const Buffer& buffer) const
+{
+    VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    info.buffer = buffer.handle;
+    return vkGetBufferDeviceAddress(device, &info);
 }
 uint32_t Device::memoryType(uint32_t bits, VkMemoryPropertyFlags flags) const
 {
@@ -149,6 +204,12 @@ Buf Device::buffer(VkDeviceSize bytes, VkBufferUsageFlags usage, bool host) cons
     vkGetBufferMemoryRequirements(device, b->handle, &req);
     VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     a.allocationSize = req.size;
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
+    {
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        a.pNext = &flags;
+    }
     a.memoryTypeIndex = memoryType(req.memoryTypeBits, host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
                                                             : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);

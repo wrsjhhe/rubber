@@ -52,6 +52,21 @@ struct OutputData
     OutputInfo info;
     std::vector<uint8_t> bytes;
 };
+enum class ContactShadow
+{
+    None,
+    ScreenSpace,
+    RayQuery
+};
+struct ShadowInfo
+{
+    bool cascaded = false;
+    bool rayQueryRequested = false;
+    ContactShadow contact = ContactShadow::None;
+    float sunAngularRadius = 0;
+    float contactLength = 0;
+    uint32_t cascadeTile = 0;
+};
 class Renderer;
 class VulkanInterop;
 class FrameResult
@@ -61,6 +76,7 @@ class FrameResult
     bool ready() const;
     void wait() const;
     double time() const;
+    ShadowInfo shadowInfo() const;
     const std::vector<OutputInfo>& outputs() const;
     OutputData read(Channel) const;
 

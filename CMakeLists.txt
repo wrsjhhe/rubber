@@ -39,6 +39,13 @@ foreach(variant "points;1" "points.depth;0")
     DEPENDS shaders/points.frag shaders/frame.glsl VERBATIM)
   list(APPEND shader_outputs "${output}")
 endforeach()
+set(ray_shader "${CMAKE_CURRENT_BINARY_DIR}/shaders/lighting.ray.frag.spv")
+add_custom_command(OUTPUT "${ray_shader}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
+  COMMAND Vulkan::glslc --target-env=vulkan1.3 -O -DRAY_QUERY=1
+          "${CMAKE_CURRENT_SOURCE_DIR}/shaders/lighting.frag" -o "${ray_shader}"
+  DEPENDS shaders/lighting.frag shaders/frame.glsl VERBATIM)
+list(APPEND shader_outputs "${ray_shader}")
 add_custom_target(renderer_shaders DEPENDS ${shader_outputs})
 # glm 是公共头文件里的类型（glm::mat4），因此作为接口目标随包一起安装：
 # 消费者只要 find_package 就能编译，不必另找一份可能版本不同的 glm。
@@ -49,7 +56,7 @@ target_include_directories(sim_glm INTERFACE
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 add_library(renderer
   src/scene/Scene.cpp src/assets/Gltf.cpp src/backend/Device.cpp
-  src/render/Pipeline.cpp src/render/RenderScene.cpp src/render/graph/FrameGraph.cpp
+  src/render/Pipeline.cpp src/render/RenderScene.cpp src/render/RayShadows.cpp src/render/graph/FrameGraph.cpp
   src/render/passes/ShadowPass.cpp src/render/passes/GeometryPass.cpp src/render/passes/LightingPass.cpp
   src/render/passes/TemporalPass.cpp src/render/passes/ColorPass.cpp src/render/passes/ReadbackPass.cpp
   src/render/passes/PointsPass.cpp
@@ -152,7 +159,7 @@ if(RENDERER_EXAMPLE)
   FetchContent_Declare(glfw URL https://codeload.github.com/glfw/glfw/zip/refs/tags/3.4 URL_HASH SHA256=a133ddc3d3c66143eba9035621db8e0bcf34dba1ee9514a9e23e96afd39fd57a)
   FetchContent_Declare(imgui URL https://codeload.github.com/ocornut/imgui/zip/refs/tags/v1.91.9b URL_HASH SHA256=fd37507c8476a6d14cc7c4b352401f31bcbd0f0d995d35390811e968c466f46e)
   FetchContent_MakeAvailable(glfw imgui)
-  add_executable(gallery example/main.cpp example/Gallery.cpp
+  add_executable(gallery example/main.cpp example/Gallery.cpp example/ShadowDemo.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)

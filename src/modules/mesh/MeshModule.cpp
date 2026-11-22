@@ -45,19 +45,22 @@ class MeshView final : public ModuleView
         bindBuffer(d, frameSet, 2, *viewData, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     }
     // 颜色链路的私有资源：阴影图集与光照描述符集合。
-    void ensureColor(const FrameResources& res)
+    VkDescriptorSet ensureColor(const FrameResources& res, bool rayQuery)
     {
-        if (shadow)
-            return;
-        shadow = d.image(tile * 2, tile * 2, depthFormat, vkUsageOf(depthUsage));
-        auto pool = descriptorPool(d, life, 8);
-        lighting = allocateSet(d, pool, pipe.lighting);
+        auto& lighting = rayQuery ? rayLighting : rasterLighting;
+        if (lighting)
+            return lighting;
+        if (!shadow)
+            shadow = d.image(tile * 2, tile * 2, depthFormat, vkUsageOf(depthUsage));
+        auto pool = descriptorPool(d, life, 1);
+        lighting = allocateSet(d, pool, rayQuery ? pipe.rayLighting : pipe.lighting);
         unsigned slot = 0;
         for (auto* image : {res.albedo.image, res.normalRough.image, res.motion.image, res.metricDepth.image,
                             res.instanceId.image})
             bindImage(d, lighting, slot++, *image, pipe.point);
         bindImage(d, lighting, 5, *res.hardwareDepth.image, pipe.point);
         bindImage(d, lighting, 6, *shadow, pipe.point);
+        return lighting;
     }
 
     MeshModule& module;
@@ -69,7 +72,10 @@ class MeshView final : public ModuleView
     const RenderScene* scene = nullptr;
     Img shadow;
     Buf viewData;
-    VkDescriptorSet lighting{};
+    VkDescriptorSet rayLighting{}, rasterLighting{};
+    VkAccelerationStructureKHR frameTlas{};
+    // 视图上一次提交完成后复用构建缓冲，TLAS 则由各自的快照持有。
+    ShadowBuildBuffers buildBuffers;
     std::array<Image*, 5> targets{};
     std::vector<uint32_t> visibleItems;
     render::PassHandle stableHandle;
@@ -95,12 +101,19 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
     useScene(sceneRef);
     targets = {res.albedo.image, res.normalRough.image, res.motion.image, res.metricDepth.image,
                res.instanceId.image};
-    if (res.lighting)
-        ensureColor(res);
+    const bool rayQuery = res.rayContact;
+    const auto lighting = res.lighting ? ensureColor(res, rayQuery) : VK_NULL_HANDLE;
     // 实例历史是网格模块私有的视图缓冲：每帧导入并绑定，由帧图管理本帧的布局与屏障。
     const auto viewBuffer =
         graph.importBuffer("view-history", {viewData->size, render::BufferUsage::Storage}, true);
     graph.bind(viewBuffer, *viewData);
+    render::BufferHandle rayInstances;
+    if (rayQuery)
+    {
+        auto& buffer = sceneRef.instances();
+        rayInstances = graph.importBuffer("shadow.instances", {buffer.size, render::BufferUsage::Storage}, true);
+        graph.bind(rayInstances, buffer);
+    }
     render::ImageHandle shadowMap;
     if (res.lighting)
     {
@@ -108,6 +121,17 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
             "shadow", imageDesc(render::Format::D32Float, tile * 2, tile * 2, depthUsage, render::Aspect::Depth),
             graphLayout(shadow->layout), true);
         graph.bind(shadowMap, *shadow);
+    }
+
+    frameTlas = VK_NULL_HANDLE;
+    render::PassHandle buildPass;
+    if (rayQuery && !sceneRef.hasShadowAcceleration())
+    {
+        buildPass = graph.reserve("shadow.acceleration");
+        graph.addPass(buildPass,
+                      [](render::FrameGraph::Declaration& d) { d.sideEffect(); },
+                      [this, &sceneRef, work = res.work](VkCommandBuffer cmd)
+                      { frameTlas = sceneRef.shadowAcceleration(d, cmd, *work, buildBuffers); });
     }
 
     // 抖动后的裁剪矩阵用于剔除：边缘物体不能因为亚像素位移被裁掉。
@@ -142,7 +166,7 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
     stationary = still;
     // 姿态基准不在这里推进：只有确认时序解析写入了颜色历史，commitHistory 才会提交它。
     stats.visibleMeshes = uint32_t(visibleItems.size());
-    if (res.lighting && options.shadows)
+    if (res.lighting && (options.shadows || options.debugChannel != 0))
         fitShadows(globals, *res.camera, items, tile);
 
     using render::Access;
@@ -182,11 +206,32 @@ void MeshView::declare(FrameResources& res, FrameStats& stats)
                 d.read(res.instanceId.handle);
                 d.read(res.hardwareDepth.handle);
                 d.read(shadowMap);
+                if (rayInstances)
+                    d.read(rayInstances, Access::StorageRead);
+                if (buildPass)
+                    d.after(buildPass);
                 d.read(res.globals.handle, Access::UniformRead);
                 d.write(res.hdr.handle, Access::ColorWrite);
             },
-            [this, &res](VkCommandBuffer cmd)
-            { recordLighting(cmd, pipe, frameSet, lighting, *res.hdr.image); });
+            [this, &res, &sceneRef, lighting, rayQuery](VkCommandBuffer cmd)
+            {
+                if (rayQuery)
+                {
+                    if (!frameTlas)
+                        frameTlas = sceneRef.shadowAcceleration(d, cmd, *res.work, buildBuffers);
+                    VkWriteDescriptorSetAccelerationStructureKHR acceleration{
+                        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
+                    acceleration.accelerationStructureCount = 1;
+                    acceleration.pAccelerationStructures = &frameTlas;
+                    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &acceleration};
+                    write.dstSet = lighting;
+                    write.dstBinding = 7;
+                    write.descriptorCount = 1;
+                    write.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+                    vkUpdateDescriptorSets(d.device, 1, &write, 0, nullptr);
+                }
+                recordLighting(cmd, pipe, frameSet, lighting, *res.hdr.image, rayQuery);
+            });
 }
 
 void MeshView::declareLate(FrameResources& res, FrameStats&)

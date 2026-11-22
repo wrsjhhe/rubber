@@ -125,6 +125,7 @@ struct FrameResult::Impl
     VkCommandBuffer command{};
     VkFence fence{};
     double timestamp = 0;
+    ShadowInfo shadows;
     bool submitted = false;
     explicit Impl(std::shared_ptr<Renderer::Impl> renderer) : owner(std::move(renderer))
     {
@@ -165,6 +166,10 @@ void FrameResult::wait() const
 double FrameResult::time() const
 {
     return impl->timestamp;
+}
+ShadowInfo FrameResult::shadowInfo() const
+{
+    return impl->shadows;
 }
 const std::vector<OutputInfo>& FrameResult::outputs() const
 {
@@ -209,6 +214,8 @@ struct View::Impl
     // 每个模块一份视图状态（阴影图、实例历史、点云描述符），由模块自己创建。
     std::vector<std::unique_ptr<vk::ModuleView>> modules;
     vk::FrameStats stats;
+    vk::FrameLifetime work;
+    ShadowInfo shadows;
     unsigned number = 0, visibleCount = 0, pointCount = 0;
     // 没有结果对象时，本帧的共享数据由视图保活到下一次等待完成。
     std::shared_ptr<vk::FrameLifetime> retained;
@@ -231,6 +238,8 @@ struct View::Impl
     DirectionalLight lastSun;
     std::vector<PointLight> lastLights;
     bool lastShadows = false;
+    bool lastRayShadows = false;
+    glm::vec2 lastShadowOptions{};
     // 帧图与瞬时资源：声明由帧图产生，分配与释放留在执行侧。
     render::FrameGraph graph;
     std::vector<std::pair<uint64_t, Img>> transientImages;
@@ -397,6 +406,10 @@ AssetStats Renderer::assetStats() const
 {
     return impl->statsOf();
 }
+bool Renderer::supportsRayQueryContactShadows() const
+{
+    return impl->d.rayQuery;
+}
 const DeviceHandles& Renderer::handles() const
 {
     return impl->d;
@@ -497,7 +510,8 @@ Submission Renderer::submit(const RenderRequest& request)
         options.taa = false;
         options.shadows = false;
     }
-    renderFrame(*frame, request.scene, request.camera, request.view, options, color, channels);
+    renderFrame(frame, request.scene, request.camera, request.view, options, color, channels);
+    state->shadows = v.shadows;
 
     auto cmd = state->command;
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -527,7 +541,6 @@ Submission Renderer::submit(const RenderRequest& request)
     auto result = std::shared_ptr<FrameResult>(new FrameResult(state));
     // 结果与视图共同持有本帧的共享数据，GPU 完成前资产与实例缓冲不会被回收。
     state->frame = frame;
-    v.retained = frame;
     v.results.push_back(result);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
@@ -600,6 +613,10 @@ VkImageView View::imageView(Channel channel) const
     }
     }
 }
+ShadowInfo View::shadowInfo() const
+{
+    return impl->shadows;
+}
 const std::vector<std::string>& View::activePasses() const
 {
     return impl->activePasses;
@@ -646,11 +663,9 @@ void Renderer::render(const SceneSnapshot& scene, const PerspectiveCamera& camer
     }
     auto frame = std::make_shared<vk::FrameLifetime>();
     impl->prepare(scene, *frame);
-    renderFrame(*frame, scene, camera, view, o, true, channels);
-    // 没有结果对象持有本帧的共享数据：由视图保活到下一次等待完成。
-    view.impl->retained = frame;
+    renderFrame(frame, scene, camera, view, o, true, channels);
 }
-void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& snapshot,
+void Renderer::renderFrame(const std::shared_ptr<vk::FrameLifetime>& frame, const SceneSnapshot& snapshot,
                            const PerspectiveCamera& camera, View& view, const RenderOptions& o, bool color,
                            const std::vector<Channel>& exports)
 {
@@ -661,7 +676,11 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
         throw std::invalid_argument("Invalid lights");
     if (o.debugChannel < 0 || o.debugChannel > 4)
         throw std::invalid_argument("Invalid debug channel");
+    if (!std::isfinite(o.sunAngularRadius) || o.sunAngularRadius < 0 || o.sunAngularRadius > 0.25f ||
+        !std::isfinite(o.contactShadowLength) || o.contactShadowLength < 0)
+        throw std::invalid_argument("Invalid directional shadow options");
     view.wait();
+    v.work = {};
     // 光照与 HDR 是否产出，与"是否出 Beauty"不是一回事：presentation 的 HDR 描述符是
     // 静态使用的，级联视图还要读它的内容，所以只要选了调试通道就必须有光照结果。
     // 旧实现按 color 导入 HDR，几何-only + 调试通道因此引用了未导入的图。
@@ -685,11 +704,16 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     f.eye = {camera.position, 1};
     f.sunDirection = {glm::normalize(snapshot.sun.direction), 0};
     f.sunColor = {snapshot.sun.radiance, 1};
+    const bool cascaded = lighting && o.shadows;
+    const bool contact = cascaded && o.contactShadowLength > 0;
+    const bool rayShadows = contact && o.rayQueryContactShadows && v.d.rayQuery;
+    const glm::vec2 shadowOptions = cascaded ? glm::vec2(o.sunAngularRadius, o.contactShadowLength) : glm::vec2(0);
+    f.shadowOptions = {shadowOptions, 0, 0};
     bool accumulate =
         o.taa && v.lastTaa && !o.resetHistory && v.lastChannel == o.debugChannel && snapshot.time >= v.time;
     accumulate = accumulate && snapshot.sun.direction == v.lastSun.direction &&
                  snapshot.sun.radiance == v.lastSun.radiance && sameLights(snapshot.lights, v.lastLights) &&
-                 o.shadows == v.lastShadows;
+                 o.shadows == v.lastShadows && rayShadows == v.lastRayShadows && shadowOptions == v.lastShadowOptions;
     auto index = (v.number % temporalSamples) + 1;
     glm::vec2 jitter =
         o.taa ? glm::vec2((2 * halton(index, 2) - 1) / v.w, (2 * halton(index, 3) - 1) / v.h) : glm::vec2(0);
@@ -766,6 +790,8 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
 
     vk::FrameResources res;
     res.graph = &graph;
+    res.work = &v.work;
+    res.rayContact = rayShadows;
     res.albedo = {albedo, v.g[0].get()};
     res.normalRough = {normalRough, v.g[1].get()};
     res.motion = {motion, v.g[2].get()};
@@ -946,10 +972,12 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     check(vkEndCommandBuffer(v.cmd), "end frame");
     v.activePasses = graph.activePasses();
     // 模块登记的首次上传与本帧在同一队列上，用时间线值声明提交依赖。
-    auto uploads = frame.uploads();
+    auto uploads = frame->uploads();
     VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
     VkPipelineStageFlags uploadStage = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (rayShadows)
+        uploadStage |= VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &v.cmd;
@@ -964,6 +992,11 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
     }
     check(vkResetFences(v.d.device, 1, &v.fence), "reset frame fence");
     check(vkQueueSubmit(v.d.queue, 1, &si, v.fence), "submit frame");
+    v.retained = frame;
+    v.work.publishSubmitted();
+    v.shadows = {cascaded, o.rayQueryContactShadows,
+                 rayShadows ? ContactShadow::RayQuery : (contact ? ContactShadow::ScreenSpace : ContactShadow::None),
+                 shadowOptions.x, shadowOptions.y, cascaded ? v.tile : 0};
 
     // 历史有效性状态只在真正写入历史的帧上推进：几何真值、仅 HDR 交付或其他被裁剪的帧
     // 没有触碰历史，不能让下一帧误判历史已作废而重新积累，也不能让它误判为可复用。
@@ -974,6 +1007,8 @@ void Renderer::renderFrame(const vk::FrameLifetime& frame, const SceneSnapshot& 
         v.lastSun = snapshot.sun;
         v.lastLights = snapshot.lights;
         v.lastShadows = o.shadows;
+        v.lastRayShadows = rayShadows;
+        v.lastShadowOptions = shadowOptions;
         v.lastTaa = o.taa;
         v.lastChannel = o.debugChannel;
         v.time = snapshot.time;
