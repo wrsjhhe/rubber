@@ -31,6 +31,18 @@ OutputInfo 给出尺寸、格式、行字节数。新增点云/高斯输出须�
 
 历史有效性必须包含相机、分辨率、场景/材质/效果版本、时间跳转和 reset；同 ID 更换资产不能继承错误运动历史。
 
+### 方向光阴影
+
+默认路径是四级 CSM、PCSS 和屏幕空间接触阴影。应用可设 `RenderOptions::rayQueryContactShadows`，把接触遮挡查询换成沿太阳方向的短射线。两种模式共用 CSM 图集、PCSS、太阳角半径和接触距离。Ray Query 用最近命中距离淡出，最大遮挡强度与屏幕空间路径一致。它可以查询屏幕外的投射网格。短射线过滤同一实例的背面命中，避免光滑曲面在明暗交界出现由三角分面造成的阶梯。其他实例的双面遮挡以及同一实例的正面遮挡仍参与查询。
+
+设备检查 `VK_KHR_ray_query`、`VK_KHR_acceleration_structure`、延迟主机操作、buffer device address 与 Synchronization2。能力查询用 `Renderer::supportsRayQueryContactShadows()`，关闭能力可用 `DeviceOptions::forceRasterShadows`。启用增强但设备不支持时使用屏幕空间接触阴影。逐帧 `FrameResult::shadowInfo()` 记录实际接触模型、请求标志、角半径、接触距离和级联图块尺寸。View 可查询最近提交的同类信息。
+
+首次使用某场景的增强模式会把 BLAS/TLAS 构建录入帧图的 `shadow.acceleration` pass。Synchronization2 屏障连接网格上传、BLAS/TLAS 构建和片元查询。只有帧成功入队后才发布加速结构缓存。同一快照跨相机共享 TLAS，BLAS 按 GPU 几何资产复用，动态 TLAS 优先快速构建。视图先等待自己的上一帧完成，再复用 TLAS 的 scratch 和实例输入缓冲。首次 BLAS 的临时缓冲也由视图保活到该帧完成。动态快照的 TLAS 仍要重建，并由该快照持有。构建和绘制同队列同一次提交。
+
+四级 CSM 使用 2×2 深度图集。延迟光照按米制深度选级。PCSS 用固定的 16 点分布搜索遮挡物，搜索半径取 `clamp(q.z * texelsPerDepth, 2, 12)`，其中 `q.z` 是从光源投影近面起的归一化深度。该搜索尺度有固定的 12 texel 上限，达到上限的像素共享固定核和尺度。找到遮挡物后，滤波半径另按受光面与平均遮挡深度的差计算，也限制在 12 texel 内。采样限制在当前级图块。太阳角半径默认 0.012 弧度，为零时使用固定 PCF。
+
+屏幕空间接触阴影沿太阳方向最多步进 16 次，使用与 G-buffer 同一套抖动，接触距离默认 0.3 米。屏幕空间阶段按第一层可见深度判断遮挡。网格 `castsShadow` 控制 CSM 和 Ray Query 的投射。两条路径只调制方向光直射分量，切换实际接触模型或有效参数会使颜色历史失效，几何真值路径保持独立。
+
 ## 共享、同步与结果
 
 资产在构造后不可变，修改内容生成新对象：顶点、索引与包围盒在构造时一次算定，全部为只读成员（测试用 `static_assert` 锁住，改回可变即编译失败）。快照按值保存材质，并持有几何与贴图的固定版本；缓存键用资产身份（几何、贴图，永不因地址复用而冲突）和材质内容，贴图再区分色彩空间。RenderScene 共享同快照 GPU 数据与上传依赖；每相机旧姿态和历史保留在 View。上传完成进入提交依赖，不能每个相机重新同步上传。
@@ -86,7 +98,7 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 
 ## 安装与分发
 
-安装树的契约：`include/sim` 公共头文件、`include/glm`（glm 是公共头文件直接暴露的类型，作为接口目标随包安装，消费侧不能与另一份 glm 混用包含路径）、静态库、按本轮产物清单安装的 SPIR-V（不整装目录，避免把改名前的旧文件带出去）、`lib/cmake/SimRenderer` 的 config/version/targets。导出目标是 `sim::renderer`，`INTERFACE_LINK_LIBRARIES` 里的 `Vulkan::Vulkan` 由包配置的 `find_dependency(Vulkan 1.3)` 提供；不请求 glslc 组件——着色器在构建本库时已经编译，消费者只需要头文件与加载库。示例的 GLFW 强制 `GLFW_INSTALL=OFF`，否则它自己的 install 规则会把 GLFW 头文件与 cmake/pkg-config 配置混进前缀。
+安装树的契约：`include/sim` 公共头文件、`include/glm`（glm 是公共头文件直接暴露的类型，作为接口目标随包安装，消费侧不能与另一份 glm 混用包含路径）、共享库（Windows 安装 bin/renderer.dll 和 lib/renderer.lib 导入库）、按本轮产物清单安装的 SPIR-V（不整装目录，避免把改名前的旧文件带出去）、`lib/cmake/SimRenderer` 的 config/version/targets。导出目标是 `sim::renderer`，`INTERFACE_LINK_LIBRARIES` 里的 `Vulkan::Vulkan` 由包配置的 `find_dependency(Vulkan 1.3)` 提供；不请求 glslc 组件——着色器在构建本库时已经编译，消费者只需要头文件与加载库。示例的 GLFW 强制 `GLFW_INSTALL=OFF`，否则它自己的 install 规则会把 GLFW 头文件与 cmake/pkg-config 配置混进前缀。
 
 shader 目录解析是这一节的核心约束：**二进制不得依赖源码或构建目录寻找 shader**。编译期默认目录是配置时的安装前缀（`${CMAKE_INSTALL_FULL_DATADIR}/sim/shaders`），运行时按四级解析：
 
@@ -97,7 +109,7 @@ shader 目录解析是这一节的核心约束：**二进制不得依赖源码�
 
 设计取舍：前两级是"意图"，错了就失败而不是悄悄换一套着色器出图；后两级是"搜索"，构建树的可执行文件靠第 3 级命中 `build/shaders`（多配置生成器在 `<build>/Release` 下、单配置在 `<build>` 下），安装后的库靠第 4 级。探测文件而不是目录存在性判断，是为了跳过残留的空目录或半删的安装。全部落空时抛出列出全部候选的错误，并提示三种修正手段；`Renderer::shaderDirectory()` 返回实际使用的目录。
 
-用 `cmake --install --prefix` 装到与配置不同的前缀时第 4 级失效——这是接受的边界，不是缺陷：静态库没有可靠的"自身位置"可查，要么显式给目录，要么把应用装进同一前缀布局。诊断文本列出候选路径，包配置导出 `SimRenderer_SHADER_DIR` 供这种场景使用。
+用 `cmake --install --prefix` 装到与配置不同的前缀时第 4 级失效——这是接受的边界，不是缺陷：当前仍按可执行文件位置与配置前缀查找。应用可显式给出 shader 路径，或把 EXE 装入同一前缀布局。Windows 应用运行时需能加载 renderer.dll。诊断文本列出候选路径，包配置导出 `SimRenderer_SHADER_DIR` 供这种场景使用。
 
 覆盖由两个测试承担，各自守不同的失败面。`shader_check`（无 GPU）锁解析顺序、显式/环境变量优先级、无效即报错且点名来源、路径归一化。`package_check`（CTest 脚本）做端到端：装到测试前缀 → 断言安装树契约（头文件、glm、库、全套 SPIR-V；导出的 target 必须带 `cxx_std_20` 编译特性；GLSL 源码不得进入）→ 断言包文件不含源码或构建目录引用 → 用只认 `find_package` 的外部项目构建（消费者不设 CMAKE_CXX_STANDARD，语言标准必须来自导出特性）→ 配置前缀**只读**检查（有合法安装则不带环境变量必须成功并命中配置目录，没有则必须失败且诊断点名配置目录）→ 测试目录内的隔离构建覆盖两个分支（全新前缀：安装命中 → 清理 → 缺失必须失败）→ 保留性断言（验证失败不清理、无 probe 的旧 shader 目录与用户文件逐字节保留）→ 设 `SIM_SHADER_DIR` 指向前缀后渲染成功。脚本的全部写入与递归删除都限制在测试前缀之内并经解析后的绝对路径校验，配置前缀零写入——probe 缺失不代表目录属于测试，不能据此授予所有权（审核发现的删除风险）。
 

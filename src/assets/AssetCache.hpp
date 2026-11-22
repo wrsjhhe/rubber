@@ -5,10 +5,12 @@
 
 namespace sim::vk
 {
+struct Acceleration;
 struct GpuMesh
 {
     Buf vertices, indices;
     uint32_t count;
+    mutable std::shared_ptr<Acceleration> shadowBlas;
 };
 using TexturePtr = std::shared_ptr<const Texture>;
 // 几何与贴图按资产身份索引：身份在构造时分配且不复用，缓存不需要保活 CPU 对象
@@ -111,9 +113,14 @@ struct AssetCache
             return it->second;
         auto& uploads = uploading();
         GpuMesh m;
+        VkBufferUsageFlags buildInput = 0;
+        if (d.rayQuery)
+            buildInput = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         m.vertices = uploads.upload(key->vertices.data(), key->vertices.size() * sizeof(Vertex),
-                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        m.indices = uploads.upload(key->indices.data(), key->indices.size() * 4, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | buildInput);
+        m.indices = uploads.upload(key->indices.data(), key->indices.size() * 4,
+                                   VK_BUFFER_USAGE_INDEX_BUFFER_BIT | buildInput);
         m.count = uint32_t(key->indices.size());
         ++stats->meshUploads;
         return meshes.emplace(key->id, std::move(m)).first->second;

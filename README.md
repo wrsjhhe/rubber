@@ -2,17 +2,33 @@
 
 一个可独立运行的 C++20 / Vulkan 1.3 离屏延迟渲染引擎。场景接口、相机和传感器输出位于 `include/sim`，Vulkan 实现在 `src`，GLFW 和 Dear ImGui 只在 `example` 中使用。开发与审核入口见 [FRAMEWORK](FRAMEWORK.md)，功能、技术、架构和进度分别维护。
 
-![引擎实机渲染的相机展厅](example/preview/courtyard.png)
+![引擎实机渲染的相机展厅](example/preview/courtyard-pcss.png)
 
 ## 构建与运行
 
-Windows 参考环境为 Visual Studio 2022 x64、CMake 3.24 及以上、Vulkan SDK 1.3 及以上（包含 glslc）。设备需要支持动态渲染、至少五个颜色附件和带计算能力的图形队列。以下命令在 renderer 目录运行。首次全新构建会下载校验过的固定版本 GLM、stb、GLFW、Dear ImGui。现有 build 已配置为使用本机下载的源码。
+Windows 使用 Visual Studio 2022 x64、CMake 3.24 及以上、Ninja 和 Vulkan SDK 1.3 及以上（含 glslc）。设备需要动态渲染、时间线信号量、独立混合、六个颜色附件和带计算能力的图形队列。可选 Ray Query 接触增强需要设备支持相应扩展。
+
+在 Visual Studio 中用「打开文件夹」打开仓库，选择 `x64 Release` 或 `x64 Debug`。也可以在 x64 Developer PowerShell 中运行：
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
-.\build\Release\gallery.exe
+cmake --preset release
+cmake --build --preset release
+```
+
+输出位于仓库旁的 `rubber-build/release`。`renderer.dll` 和 `shaders/` 由三个示例共用，直接双击 EXE 即可运行。
+
+| 程序 | 内容 |
+|---|---|
+| `gallery.exe` | 资产展厅和基础几何 |
+| `shadow_demo.exe` | 阴影对比与性能测量 |
+| `sensor_demo.exe` | 双相机采集与像素检查 |
+
+测试默认关闭，启用时使用独立的 `tests` 预设。Ninja 把新产物放在源码树外，Visual Studio 工作区配置排除旧构建目录。若旧会话仍列出 `.vcxproj`，请关闭并重新打开仓库文件夹后选择新预设。
+
+```powershell
+cmake --preset tests
+cmake --build --preset tests
+ctest --preset tests
 ```
 
 - `gallery --model path/to/asset.glb` 将静态不透明 glTF 模型放到展台上，也支持含外部缓冲和图片的 .gltf。
@@ -22,20 +38,63 @@ ctest --test-dir build -C Release --output-on-failure
 - 仅编译引擎可传入 `-DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF`。gallery 在构建树里靠可执行文件相对路径找到着色器，示例资产仍来自源码目录；安装与外部消费见下节。
 - `python tools/pngdiff.py a.png b.png` 统计两张 PNG 的差异字节数、最大与平均通道差，用于核对捕获画面是否只差舍入。
 
+## 双相机仿真采集台
+
+```powershell
+..\rubber-build\release\sensor_demo.exe
+..\rubber-build\release\sensor_demo.exe --capture sensor-demo.png
+..\rubber-build\release\sensor_demo.exe --check --validation
+```
+
+两台 640×360 相机从正面和斜侧面观察同一份带时间戳的场景快照。橙色小车在两路图像中同步移动。用 **Pause**、**Step** 和 **Reset time** 检查同一时刻，点击任一图像查看该像素的米制光轴深度和实例 ID。A 相机初始选中的标定板中心深度为 4.500 m。每台相机可独立切换 RGB、米制深度和实例 ID，面板同时显示实际标定和 pass 清单。
+
+打开 **Truth only** 后，仅请求米制深度和实例 ID，两台相机的 pass 清单均只剩 `geometry`。深度与标签的颜色是示例在 CPU 侧生成的预览，检查值来自原始读回数据。离屏 PNG 的左右列为 A、B 两台相机，从上到下是 RGB、米制深度和实例 ID。无窗口的 `sensor_demo_check` 核对共享快照、板深度、移动更新和请求切换后的真值一致性。
+
+## 阴影对比 Demo
+
+```powershell
+..\rubber-build\release\shadow_demo.exe
+..\rubber-build\release\shadow_demo.exe --offscreen
+..\rubber-build\release\shadow_demo.exe --closeup --capture shadow-compare.png
+..\rubber-build\release\shadow_demo.exe --benchmark
+..\rubber-build\release\shadow_demo.exe --benchmark --closeup
+```
+
+窗口支持并排、屏幕空间接触阴影、Ray Query 接触阴影三种视图。两路共用同一场景快照、相机、四级 CSM 与 PCSS 参数。长柱廊用于观察远近阴影与细栏杆，接触近景用不同悬空高度的球体观察半影。截图左侧为屏幕空间接触，右侧为 Ray Query 接触。缺少设备能力时界面只显示屏幕空间方案，`--raster-shadows` 可用于复现回退。
+
+第三个场景 **Offscreen caster** 把五根遮挡条放在相机后方。屏幕空间只读可见深度，Ray Query 可查询这五根遮挡条并在受光板上补出接触阴影。可用 `shadow_demo --offscreen --capture offscreen.png` 导出对照。
+
+点击 **Run benchmark** 或用命令行测量三种方案。每个场景分静止与移动投射物两组，使用固定相机、960×600 分辨率、每级 1024×1024 的 CSM 图块，关闭 TAA，各路径预热 20 帧并记录 100 帧。端到端耗时包含 CPU 录制、GPU 渲染与等待，涵盖动态 TLAS 的构建。另列 `submit p50`，表示从调用 `render()` 到返回的耗时。窗口呈现和图像读回在计时区间之外。
+
+应用可用 `RenderOptions::rayQueryContactShadows` 显式开启增强，通过 `FrameResult::shadowInfo()` 查询实际采用的接触模型及参数。
+
+RTX 3080 Ti 的一次 Release 实测如下，单位为毫秒。静态场景复用 TLAS，移动投射物仍需在对应帧构建 TLAS。
+
+| 场景 | 屏幕空间 p50 / p95 | Ray Query 增强 p50 / p95 | 增强模式提交 p50 |
+|---|---:|---:|---:|
+| 长柱廊，静止 | 3.608 / 4.018 | 3.596 / 4.005 | 3.280 |
+| 长柱廊，移动投射物 | 3.731 / 4.082 | 3.987 / 4.430 | 3.661 |
+| 接触近景，静止 | 0.611 / 0.780 | 0.589 / 0.829 | 0.393 |
+| 接触近景，移动投射物 | 0.710 / 0.987 | 0.855 / 1.067 | 0.609 |
+
+当前 Gallery 的默认画面基线为 [courtyard-pcss.png](example/preview/courtyard-pcss.png)。用 `gallery --capture courtyard-pcss.png --validation` 生成。旧版预览仍可用于历史比对，差异统计见 [实现进度](docs/PROGRESS.md)。
+
 ## 安装与消费
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_INSTALL_PREFIX=C:/libs/sim-renderer
-cmake --build build --config Release
-cmake --install build --config Release
+cmake --preset release -DCMAKE_INSTALL_PREFIX=C:/libs/sim-renderer
+cmake --build --preset release --target renderer
+cmake --install ../rubber-build/release
 ```
 
-安装树自包含：`include/sim` 公共头文件、`include/glm`（glm 是公共头文件里的类型，随包安装）、`lib/renderer.lib`、`share/sim/shaders/*.spv` 与 `lib/cmake/SimRenderer`。外部项目只需要：
+安装树自包含：`include/sim` 公共头文件、`include/glm`（glm 是公共头文件里的类型，随包安装）、Windows 的 `bin/renderer.dll` 与 `lib/renderer.lib` 导入库、`share/sim/shaders/*.spv` 与 `lib/cmake/SimRenderer`。外部项目只需要：
 
 ```cmake
 find_package(SimRenderer 0.1 REQUIRED)
 target_link_libraries(app PRIVATE sim::renderer)
 ```
+
+Windows 部署时，将 `renderer.dll` 放在应用 EXE 旁边，或放入应用的 DLL 搜索路径。公开接口含 C++ 标准库类型，消费应用应使用兼容的 MSVC 工具链和运行库，Debug 与 Release 产物分开使用。着色器仍按下面的顺序查找。
 
 包配置只请求 `find_dependency(Vulkan 1.3)`——着色器已预编译为 SPIR-V，消费者不需要 glslc。导出的 target 带 `cxx_std_20` 编译特性，消费者不必自己设置 C++ 标准。着色器目录按以下顺序解析，取第一个含 `geometry.vert.spv` 的：
 
@@ -55,13 +114,13 @@ target_link_libraries(app PRIVATE sim::renderer)
 | 帧图 | pass 只声明读写意图，帧图负责反向裁剪、RAW/WAR/WAW 依赖、子资源与缓冲范围求交、屏障推导；跨帧历史以持久导入/导出/恢复表达。阴影、几何、光照、时序解析、颜色变换、读回是彼此独立、可按请求裁剪的 pass |
 | 几何 | Box、Sphere、Cylinder、Cone、Capsule、点集 Convex、索引 TriangleMesh。各生成器输出统一 BufferGeometry |
 | 材质 | GGX 金属粗糙度模型、底色/法线/金属粗糙度纹理、sRGB 解码、mipmap、线性 HDR、色调映射。环境项使用解析天空近似 |
-| 光照 | 一盏方向光，最多 16 盏平方反比衰减点光。方向光采用四级 CSM、光空间 texel 对齐和 3×3 PCF |
+| 光照 | 一盏方向光，最多 16 盏平方反比衰减点光。默认使用四级 CSM、PCSS 和屏幕空间接触阴影，支持的设备可显式启用 Ray Query 接触增强。独立的 `shadow_demo` 可并排比较 |
 | 剔除 | CPU 包围盒视锥剔除 |
 | TAA | 静止时对 16 个 Halton 子像素样本取线性 HDR 平均，前景与天空边缘均按覆盖率积累。运动时使用无抖动速度、前景速度扩展、逐点深度检验、三次重建和邻域限幅。每个视图独立保存历史 |
 | 传感器 | 按像素指定 fx/fy/cx/cy，GPU 附件访问，可选异步 RGBA8、米制 Z 和 uint32 实例 ID 批量读回，帧携带仿真时间。`observe()` 在同一次提交上另返回标定、采样时间与通道语义，投影由标定反算且与渲染器逐元素一致；处理链只能新增派生输出 |
 | 呈现 | 调试通道不进入光照：`lighting.frag` 只输出 Beauty，调试图由独立的 `presentation` pass 写单独图像，因此同一帧的 Beauty 与调试视图互不串色，HDR 与时序历史里只有 Beauty |
 | 导入与示例 | 静态 glTF/GLB 节点、索引、UV0、核心 PBR 贴图，外部或 GLB 内嵌 PNG/JPEG。交互展厅、七种几何体、轨道相机、光照及 G-buffer 预览（窗口采样调试图而非覆盖 Beauty） |
-| 安装与分发 | `cmake --install` 产出自包含前缀：公共头文件、随包安装的 glm、静态库、预编译 SPIR-V 与 CMake 包文件；`find_package(SimRenderer)` 导出 `sim::renderer`，消费者不需要 glslc；shader 目录运行时解析，二进制不指向源码/构建目录 |
+| 安装与分发 | `cmake --install` 产出自包含前缀：公共头文件、随包安装的 glm、共享库、预编译 SPIR-V 与 CMake 包文件；`find_package(SimRenderer)` 导出 `sim::renderer`，消费者不需要 glslc；shader 目录运行时解析，二进制不指向源码/构建目录 |
 
 ## 最小离屏采集
 

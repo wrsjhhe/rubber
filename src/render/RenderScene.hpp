@@ -4,6 +4,11 @@
 
 namespace sim::vk
 {
+class FrameLifetime;
+struct ShadowBuildBuffers
+{
+    Buf scratch, instances;
+};
 // 顶点与片元着色器共用的静态实例数据。内容由快照决定，与该快照的所有相机共享；
 // 上一帧变换与历史匹配标记属于视图，见 ViewInstance。
 struct SceneInstance
@@ -49,7 +54,7 @@ class RenderScene
     {
         return draws;
     }
-    const Buffer& instances() const
+    Buffer& instances() const
     {
         return *staticData;
     }
@@ -58,6 +63,11 @@ class RenderScene
     {
         return uploadValue;
     }
+    bool hasShadowAcceleration() const
+    {
+        return bool(shadowTlas);
+    }
+    VkAccelerationStructureKHR shadowAcceleration(Device&, VkCommandBuffer, FrameLifetime&, ShadowBuildBuffers&) const;
     // 内容一致性核对，用于哈希键命中后排除碰撞。
     bool matches(const SceneSnapshot&) const;
 
@@ -66,5 +76,6 @@ class RenderScene
     std::shared_ptr<AssetCache> assets;
     std::vector<Item> draws;
     Buf staticData;
+    mutable std::shared_ptr<Acceleration> shadowTlas;
 };
 }

@@ -35,9 +35,12 @@ struct FrameStats
     uint32_t visiblePoints = 0;
 };
 // 帧级共享资源。句柄由视图导入并绑定，模块只读使用；私有资源（阴影图等）由模块自己导入。
+class FrameLifetime;
 struct FrameResources
 {
     render::FrameGraph* graph = nullptr;
+    FrameLifetime* work = nullptr;
+    bool rayContact = false;
     // 几何真值：五个 G-buffer 与硬件深度。
     FrameImage albedo, normalRough, motion, metricDepth, instanceId, hardwareDepth;
     // 颜色路径：光照结果、显示图、阴影图集与历史槽。
@@ -74,6 +77,17 @@ class FrameLifetime
     {
         return uploadValue;
     }
+    // 缓存只有在包含构建的帧成功入队后才可发布。
+    void onSubmitted(std::function<void()> callback)
+    {
+        submitted.push_back(std::move(callback));
+    }
+    void publishSubmitted()
+    {
+        for (const auto& callback : submitted)
+            callback();
+        submitted.clear();
+    }
     size_t size() const
     {
         return held.size();
@@ -81,6 +95,7 @@ class FrameLifetime
 
   private:
     std::vector<std::shared_ptr<const void>> held;
+    std::vector<std::function<void()>> submitted;
     uint64_t uploadValue = 0;
 };
 // 视图侧模块状态：只保存与该相机相关的资源（阴影图、实例历史、描述符集合）。

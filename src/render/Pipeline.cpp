@@ -110,13 +110,15 @@ VkPipeline graphicsPipeline(Device& d, Lifetime& life, const std::filesystem::pa
 }
 Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(device)
 {
-    auto setLayout = [&](unsigned n, bool buffers)
+    auto setLayout = [&](unsigned n, bool buffers, bool acceleration = false)
     {
         std::vector<VkDescriptorSetLayoutBinding> bindings(n);
         for (unsigned i = 0; i < n; ++i)
         {
             auto type = buffers ? (i ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
                                 : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            if (acceleration && i == 7)
+                type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
             bindings[i] = {i, type, 1,
                            VkShaderStageFlags(buffers
                                                   ? (VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT)
@@ -134,6 +136,8 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
     frame = setLayout(3, true);
     material = setLayout(3, false);
     lighting = setLayout(7, false);
+    if (d.rayQuery)
+        rayLighting = setLayout(8, false, true);
     resolve = setLayout(4, false);
     colorSet = setLayout(1, false);
     // 调试呈现：法线、米制深度、实例标签，加级联视图需要的 HDR。
@@ -182,8 +186,15 @@ Pipelines::Pipelines(Device& device, const std::filesystem::path& dir) : d(devic
     splatState.blendIndex = 5;
     shadow = graphicsPipeline(d, life, dir, "shadow.vert", nullptr, meshLayout, {}, zOnly);
     geometry = graphicsPipeline(d, life, dir, "geometry.vert", "geometry.frag", meshLayout, gFormats, mesh);
-    shade = graphicsPipeline(d, life, dir, "fullscreen.vert", "lighting.frag", lightLayout, std::array{hdrFormat},
-                             fullscreen);
+    shade = graphicsPipeline(d, life, dir, "fullscreen.vert", "lighting.frag",
+                             lightLayout, std::array{hdrFormat}, fullscreen);
+    if (d.rayQuery)
+    {
+        rayLightLayout = layout(rayLighting);
+        shadeRay = graphicsPipeline(d, life, dir, "fullscreen.vert", "lighting.ray.frag",
+                                    rayLightLayout, std::array{hdrFormat}, fullscreen);
+
+    }
     temporal =
         graphicsPipeline(d, life, dir, "fullscreen.vert", "temporal.frag", resolveLayout, std::array{hdrFormat},
                          fullscreen);
@@ -224,10 +235,11 @@ VkDescriptorPool descriptorPool(Device& d, Lifetime& life, uint32_t count)
 {
     VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, count},
                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, count * 3},
-                                    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, count * 7}};
+                                    {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, count * 7},
+                                    {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, count}};
     VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     ci.maxSets = count;
-    ci.poolSizeCount = 3;
+    ci.poolSizeCount = d.rayQuery ? 4 : 3;
     ci.pPoolSizes = sizes;
     VkDescriptorPool h;
     check(vkCreateDescriptorPool(d.device, &ci, nullptr, &h), "descriptor pool");

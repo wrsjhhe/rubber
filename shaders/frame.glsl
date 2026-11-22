@@ -1,6 +1,7 @@
 layout(std140,set=0,binding=0) uniform Frame {
     mat4 vp, oldVP, invVP, lightVP[4];
     vec4 eye, sunDirection, sunColor, splits, jitter, settings, pointPosition[16], pointColor[16], info, lens;
+    vec4 shadowOptions;
 } frame;
 struct Instance {
     mat4 model;

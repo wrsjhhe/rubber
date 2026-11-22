@@ -2,6 +2,7 @@
 #include "sim/Renderer.hpp"
 #include "sim/VulkanInterop.hpp"
 #include <glm/gtc/matrix_transform.hpp>
+#include <array>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -32,6 +33,7 @@ int main(int argc, char** argv)
 try
 {
     DeviceOptions device;
+    device.forceRasterShadows = true;
     device.validation = argc > 1 && std::string_view(argv[1]) == "--validation";
     Renderer renderer(device);
     Scene scene;
@@ -123,6 +125,154 @@ try
                  "Repeated debug request");
     repeated.frame.reset();
 
+    debug.contactShadowLength = 0;
+    auto changed = renderer.submit({snapshot, camera, *view, {{Channel::Color, Delivery::Cpu}}, debug});
+    expect(changed.status == SubmitStatus::Submitted, "Shadow option request was rejected");
+    expect(view->activePasses().front() == "history.clear", "Shadow option change reused color history");
+    changed.frame.reset();
+
+    // 用地面和悬空遮挡物分别验证 PCSS 和短距离屏幕空间阴影确实改变光照。
+    Scene shadowScene;
+    shadowScene.sun.direction = {-0.7f, -1.f, 0.5f};
+    shadowScene.add(BoxGeometry(), material,
+                    glm::scale(glm::translate(glm::mat4(1), {0, -.1f, 0}), {8, .2f, 8}));
+    auto caster = shadowScene.add(BoxGeometry(), material, glm::translate(glm::mat4(1), {0, .65f, 0}));
+    auto shadowSnapshot = shadowScene.snapshot(2);
+    auto shadowView = renderer.createView(256, 192, 512);
+    PerspectiveCamera shadowCamera;
+    shadowCamera.position = {2, 2, 4};
+    shadowCamera.farPlane = 20;
+    auto captureShadow = [&](float angularRadius, float contactLength, bool rayRequested = false)
+    {
+        RenderOptions options;
+        options.taa = false;
+        options.sunAngularRadius = angularRadius;
+        options.rayQueryContactShadows = rayRequested;
+        options.contactShadowLength = contactLength;
+        auto result = renderer.submit({shadowSnapshot, shadowCamera, *shadowView,
+                                       {{Channel::Hdr, Delivery::Cpu}, {Channel::MetricDepth, Delivery::Cpu},
+                                        {Channel::InstanceId, Delivery::Cpu}}, options});
+        expect(result.status == SubmitStatus::Submitted, "Shadow test capture was rejected");
+        if (rayRequested)
+            expect(result.frame->shadowInfo().rayQueryRequested &&
+                       result.frame->shadowInfo().contact == ContactShadow::ScreenSpace,
+                   "Disabled Ray Query device did not report screen-space fallback");
+        return std::array{result.frame->read(Channel::Hdr).bytes,
+                          result.frame->read(Channel::MetricDepth).bytes,
+                          result.frame->read(Channel::InstanceId).bytes};
+    };
+    const auto pcf = captureShadow(0, 0);
+    const auto pcss = captureShadow(.06f, 0);
+    const auto contact = captureShadow(.06f, .5f);
+    expect(pcf[0] != pcss[0], "PCSS did not change the shadowed radiance");
+    expect(pcss[0] != contact[0], "Contact shadows did not change the shadowed radiance");
+    expect(captureShadow(.06f, .5f, true) == contact, "Ray Query fallback changed raster output");
+    expect(pcf[1] == pcss[1] && pcss[1] == contact[1] && pcf[2] == pcss[2] && pcss[2] == contact[2],
+           "Shadow options changed geometry truth");
+    expect(!renderer.supportsRayQueryContactShadows(), "Forced raster device enabled Ray Query");
+    device.forceRasterShadows = false;
+    Renderer automatic(device);
+    auto autoView = automatic.createView(256, 192, 512);
+    auto secondView = automatic.createView(256, 192, 512);
+    auto autoCapture = [&](View& view, const SceneSnapshot& source, bool ray, float contactLength = .5f,
+                           const PerspectiveCamera* cameraOverride = nullptr)
+    {
+        RenderOptions options;
+        options.taa = false;
+        options.rayQueryContactShadows = ray;
+        options.contactShadowLength = contactLength;
+        auto result = automatic.submit({source, cameraOverride ? *cameraOverride : shadowCamera, view,
+                                        {{Channel::Hdr, Delivery::Cpu}, {Channel::MetricDepth, Delivery::Cpu},
+                                         {Channel::InstanceId, Delivery::Cpu}}, options});
+        expect(result.status == SubmitStatus::Submitted, "Contact shadow capture was rejected");
+        return result.frame;
+    };
+    const auto raster = autoCapture(*autoView, shadowSnapshot, false);
+    expect(raster->shadowInfo().contact == ContactShadow::ScreenSpace, "Default contact mode is not screen space");
+    expectPasses(*autoView, {"shadow", "geometry", "lighting"}, "Default CSM/PCSS contact");
+
+    // 连续提交两台相机，再读回结果。第二次提交应复用同队列里刚入队的加速结构。
+    const auto enhanced = autoCapture(*autoView, shadowSnapshot, true);
+    if (automatic.supportsRayQueryContactShadows())
+    {
+        expectPasses(*autoView, {"shadow.acceleration", "shadow", "geometry", "lighting"}, "Hybrid first build");
+        auto shared = autoCapture(*secondView, shadowSnapshot, true);
+        expectPasses(*secondView, {"shadow", "geometry", "lighting"}, "Hybrid cross-view reuse");
+        expect(enhanced->shadowInfo().contact == ContactShadow::RayQuery &&
+                   enhanced->shadowInfo().cascaded && enhanced->shadowInfo().rayQueryRequested,
+               "Hybrid shadow metadata did not retain CSM and Ray Query");
+        expect(shared->read(Channel::Hdr).bytes == enhanced->read(Channel::Hdr).bytes,
+               "Hybrid output differed across views using the same camera");
+
+        shadowScene.get(caster).local[3].x += 1.f;
+        auto moved = autoCapture(*secondView, shadowScene.snapshot(3), true);
+        expectPasses(*secondView, {"shadow.acceleration", "shadow", "geometry", "lighting"}, "Moved caster rebuild");
+        expect(moved->read(Channel::Hdr).bytes != shared->read(Channel::Hdr).bytes, "Moved caster did not update lighting");
+        // 凸球没有真实的自身遮挡。短射线从球面背面穿出时，不能把平滑明暗交界切成分面。
+        Scene sphere;
+        sphere.sun = shadowScene.sun;
+        sphere.add(SphereGeometry(1.f, 16, 8), material);
+        const auto singleSphere = sphere.snapshot(4);
+        auto sphereView = automatic.createView(320, 240, 512);
+        auto sphereBase = autoCapture(*sphereView, singleSphere, false, 0);
+        auto sphereRay = autoCapture(*sphereView, singleSphere, true, .3f);
+        expect(sphereBase->read(Channel::Hdr).bytes == sphereRay->read(Channel::Hdr).bytes,
+               "Ray Query darkened the terminator of a convex sphere");
+        // 相机只看到受光板。细遮挡条在相机背后，其光线投影穿过板中心。
+        Scene offscreen;
+        offscreen.sun.direction = {-.35f, 0, -1};
+        const auto panel = offscreen.add(BoxGeometry(.5f, .3f, .02f), material,
+                                         glm::translate(glm::mat4(1), {0, 0, -.01f}));
+        const auto hidden = offscreen.add(BoxGeometry(.018f, .24f, .006f), material,
+                                          glm::translate(glm::mat4(1), {.35f * .21f, 0, .21f}));
+        auto offscreenSnapshot = offscreen.snapshot(5);
+        PerspectiveCamera nearby;
+        nearby.position = {0, 0, .15f};
+        nearby.nearPlane = .01f;
+        nearby.farPlane = 120;
+        auto offscreenView = automatic.createView(256, 192, 64);
+        const auto screen = autoCapture(*offscreenView, offscreenSnapshot, false, .3f, &nearby);
+        const auto world = autoCapture(*offscreenView, offscreenSnapshot, true, .3f, &nearby);
+        const auto screenHdr = screen->read(Channel::Hdr);
+        const auto worldHdr = world->read(Channel::Hdr);
+        const auto labels = world->read(Channel::InstanceId);
+        auto label = [&](unsigned x, unsigned y)
+        {
+            uint32_t value;
+            std::memcpy(&value, labels.bytes.data() + y * labels.info.rowBytes + x * sizeof(value), sizeof(value));
+            return value;
+        };
+        auto red = [](const OutputData& image, unsigned x, unsigned y)
+        {
+            // 非负有限半精度颜色的位表示与亮度单调一致。
+            uint16_t value;
+            std::memcpy(&value, image.bytes.data() + y * image.info.rowBytes + x * 8, sizeof(value));
+            return value;
+        };
+        for (unsigned y = 0; y < labels.info.height; ++y)
+            for (unsigned x = 0; x < labels.info.width; ++x)
+                expect(label(x, y) != hidden, "Behind-camera caster leaked into the G-buffer");
+        expect(label(128, 96) == panel && label(72, 96) == panel, "Expected visible receiver samples");
+        expect(red(worldHdr, 128, 96) + 64 < red(screenHdr, 128, 96),
+               "Ray Query did not darken the predicted offscreen contact");
+        expect(red(worldHdr, 72, 96) == red(screenHdr, 72, 96),
+               "Ray Query changed the receiver outside the projected stripe");
+        std::cout << "PASS: CSM and hybrid contact shadows, shared and dynamic TLAS\n";
+    }
+    else
+    {
+        expectPasses(*autoView, {"shadow", "geometry", "lighting"}, "Unsupported-Ray Query fallback");
+        expect(enhanced->shadowInfo().contact == ContactShadow::ScreenSpace && enhanced->shadowInfo().rayQueryRequested,
+               "Fallback metadata lost the requested or actual contact mode");
+    }
+    expect(raster->read(Channel::MetricDepth).bytes == enhanced->read(Channel::MetricDepth).bytes &&
+               raster->read(Channel::InstanceId).bytes == enhanced->read(Channel::InstanceId).bytes,
+           "Contact shadow mode changed geometry truth");
+
+    auto noContact = autoCapture(*secondView, shadowSnapshot, true, 0);
+    expectPasses(*secondView, {"shadow", "geometry", "lighting"}, "Zero contact reach keeps CSM");
+    expect(noContact->shadowInfo().contact == ContactShadow::None && noContact->shadowInfo().cascaded,
+           "Zero contact reach disabled CSM");
     std::cout << "PASS: frame graph culls passes to the requested outputs\n";
     return 0;
 }

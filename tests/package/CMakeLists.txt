@@ -6,7 +6,24 @@ project(SimRendererPackageCheck LANGUAGES CXX)
 # 只通过安装前缀找包：不 include 原项目的任何 CMake 文件，也不引用它的源码。
 find_package(SimRenderer 0.1 REQUIRED)
 add_executable(sim_package_check main.cpp)
+# 单配置生成器不自动加 Release 子目录。显式隔开安装树，确保默认搜索用例
+# 不会因为 EXE 恰好在安装前缀下一层而命中 ../share/sim/shaders。
+set_target_properties(sim_package_check PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
 target_link_libraries(sim_package_check PRIVATE sim::renderer)
+get_target_property(rendererType sim::renderer TYPE)
+if(NOT rendererType STREQUAL "SHARED_LIBRARY")
+  message(FATAL_ERROR "The installed renderer is expected to be a shared library")
+endif()
+# 隔离安装前缀清掉后，负例仍需加载同一份 DLL/共享库，以确认失败发生在着色器查找。
+add_custom_command(TARGET sim_package_check POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "$<TARGET_FILE:sim::renderer>" "$<TARGET_FILE_DIR:sim_package_check>"
+  VERBATIM)
+if(APPLE)
+  set_target_properties(sim_package_check PROPERTIES BUILD_RPATH "@loader_path")
+elseif(UNIX)
+  set_target_properties(sim_package_check PROPERTIES BUILD_RPATH "$ORIGIN")
+endif()
 if(MSVC)
   target_compile_options(sim_package_check PRIVATE /utf-8 /EHsc)
 endif()

@@ -20,6 +20,8 @@ struct DeviceOptions
     std::function<VkSurfaceKHR(VkInstance)> createSurface;
     bool validation = false;
     std::filesystem::path shaderDirectory;
+    // 禁用设备的 Ray Query 接触阴影能力，便于验证屏幕空间回退。
+    bool forceRasterShadows = false;
 };
 struct DeviceHandles
 {
@@ -39,6 +41,12 @@ struct RenderOptions
     // 调试呈现通道，只决定 Debug 输出显示什么，不进入 Color/Hdr。
     // 0 彩色，1 法线，2 米制深度，3 实例标签，4 级联分区。
     int debugChannel = 0;
+    // 太阳角半径（弧度），为零时使用单条阴影射线或固定核 PCF。
+    float sunAngularRadius = 0.012f;
+    // 接触遮挡的最大查询距离（米），屏幕空间和 Ray Query 共用，为零时关闭。
+    float contactShadowLength = 0.3f;
+    // 用短距离 Ray Query 替换屏幕空间接触阴影。设备不支持时使用屏幕空间路径。
+    bool rayQueryContactShadows = false;
 };
 struct Frame
 {
@@ -70,6 +78,7 @@ class View
     bool stationary() const;
     // 上一帧帧图实际执行的 pass 清单（按执行顺序），用于确认按需裁剪。
     const std::vector<std::string>& activePasses() const;
+    ShadowInfo shadowInfo() const;
 
   private:
     friend class Renderer;
@@ -117,6 +126,7 @@ class Renderer
     void clearAssetCache();
     AssetStats assetStats() const;
     const DeviceHandles& handles() const;
+    bool supportsRayQueryContactShadows() const;
     VkSampler displaySampler() const;
     // 本次实例实际使用的着色器目录（候选顺序与失败诊断见 ShaderDirectory.hpp）。
     // 安装后出问题时先看这一项：它应当位于安装前缀之下，而不是源码或构建目录。
@@ -125,7 +135,7 @@ class Renderer
   private:
     friend class View;
     friend class FrameResult;
-    void renderFrame(const vk::FrameLifetime&, const SceneSnapshot&, const PerspectiveCamera&, View&,
+    void renderFrame(const std::shared_ptr<vk::FrameLifetime>&, const SceneSnapshot&, const PerspectiveCamera&, View&,
                      const RenderOptions&, bool color, const std::vector<Channel>& exports);
     struct Impl;
     std::shared_ptr<Impl> impl;

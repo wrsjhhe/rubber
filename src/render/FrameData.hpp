@@ -19,8 +19,9 @@ struct Globals
     // 纯投影的两轴焦距（像素单位）。vp 含视图旋转，用它的元素当焦距会让点尺寸随俯仰/翻滚变化，
     // 因此单独传递内参：x、y 各一个尺度，fx != fy 的标定相机也能正确换算出椭圆足迹。
     glm::vec4 lens;
+    glm::vec4 shadowOptions;
 };
-static_assert(sizeof(Globals) == 1088);
+static_assert(sizeof(Globals) == 1104);
 struct Draw
 {
     uint32_t object;

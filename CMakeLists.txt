@@ -11,11 +11,12 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 find_package(Vulkan 1.3 REQUIRED COMPONENTS glslc)
 include(FetchContent)
-option(RENDERER_EXAMPLE "Build the GLFW / Dear ImGui gallery" ON)
+option(RENDERER_EXAMPLE "Build the three GLFW / Dear ImGui demos" ON)
+option(BUILD_TESTING "Build renderer checks" OFF)
 option(RENDERER_INSTALL "Install headers, library, shaders and the CMake package" ON)
-FetchContent_Declare(glm URL https://codeload.github.com/g-truc/glm/zip/refs/tags/1.0.1 URL_HASH SHA256=09c5716296787e1f7fcb87b1cbdbf26814ec1288ed6259ccd30d5d9795809fa5)
+FetchContent_Declare(glm URL https://codeload.github.com/g-truc/glm/zip/refs/tags/1.0.1 URL_HASH SHA256=09c5716296787e1f7fcb87b1cbdbf26814ec1288ed6259ccd30d5d9795809fa5 SOURCE_SUBDIR headers-only)
 FetchContent_Declare(stb URL https://codeload.github.com/nothings/stb/zip/f0569113c93ad095470c54bf34a17b36646bbbb5 URL_HASH SHA256=b62be3009cb9d4b6385bd4854bddf72d8e91f4e19d1347d6cf9589b19f70d45d)
-set(GLM_BUILD_LIBRARY OFF CACHE BOOL "" FORCE)
+
 FetchContent_MakeAvailable(glm stb)
 set(shader_outputs)
 foreach(shader geometry.vert geometry.frag shadow.vert fullscreen.vert lighting.frag temporal.frag color.frag
@@ -39,7 +40,14 @@ foreach(variant "points;1" "points.depth;0")
     DEPENDS shaders/points.frag shaders/frame.glsl VERBATIM)
   list(APPEND shader_outputs "${output}")
 endforeach()
-add_custom_target(renderer_shaders DEPENDS ${shader_outputs})
+set(ray_shader "${CMAKE_CURRENT_BINARY_DIR}/shaders/lighting.ray.frag.spv")
+add_custom_command(OUTPUT "${ray_shader}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/shaders"
+  COMMAND Vulkan::glslc --target-env=vulkan1.3 -O -DRAY_QUERY=1
+          "${CMAKE_CURRENT_SOURCE_DIR}/shaders/lighting.frag" -o "${ray_shader}"
+  DEPENDS shaders/lighting.frag shaders/frame.glsl VERBATIM)
+list(APPEND shader_outputs "${ray_shader}")
+
 # glm 是公共头文件里的类型（glm::mat4），因此作为接口目标随包一起安装：
 # 消费者只要 find_package 就能编译，不必另找一份可能版本不同的 glm。
 add_library(sim_glm INTERFACE)
@@ -47,9 +55,9 @@ add_library(sim::glm ALIAS sim_glm)
 target_include_directories(sim_glm INTERFACE
   $<BUILD_INTERFACE:${glm_SOURCE_DIR}>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-add_library(renderer
+add_library(renderer SHARED
   src/scene/Scene.cpp src/assets/Gltf.cpp src/backend/Device.cpp
-  src/render/Pipeline.cpp src/render/RenderScene.cpp src/render/graph/FrameGraph.cpp
+  src/render/Pipeline.cpp src/render/RenderScene.cpp src/render/RayShadows.cpp src/render/graph/FrameGraph.cpp
   src/render/passes/ShadowPass.cpp src/render/passes/GeometryPass.cpp src/render/passes/LightingPass.cpp
   src/render/passes/TemporalPass.cpp src/render/passes/ColorPass.cpp src/render/passes/ReadbackPass.cpp
   src/render/passes/PointsPass.cpp
@@ -57,7 +65,9 @@ add_library(renderer
   src/sensors/Observation.cpp src/sensors/Processing.cpp src/presentation/Presentation.cpp
   src/render/ShaderDirectory.cpp src/render/Renderer.cpp)
 add_library(sim::renderer ALIAS renderer)
-add_dependencies(renderer renderer_shaders)
+# 着色器随库构建，不产生可单独启动的项目。
+target_sources(renderer PRIVATE ${shader_outputs})
+set_target_properties(renderer PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_include_directories(renderer
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
   PRIVATE ${stb_SOURCE_DIR} third_party/cgltf)
@@ -107,19 +117,24 @@ if(BUILD_TESTING)
   target_include_directories(shader_check PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_compile_definitions(shader_check PRIVATE "TEST_BUILD_SHADER_DIR=\"${CMAKE_CURRENT_BINARY_DIR}/shaders\"")
   add_test(NAME shader_check COMMAND shader_check)
-  # 安装 + 导出包 + 外部项目 find_package 构建并离屏运行的端到端检查。
-  add_test(NAME package_check
-    COMMAND ${CMAKE_COMMAND}
-      "-DProjectSource=${CMAKE_CURRENT_SOURCE_DIR}"
-      "-DProjectBuild=${CMAKE_CURRENT_BINARY_DIR}"
-      "-DConfig=$<CONFIG>"
-      "-DPrefix=${CMAKE_CURRENT_BINARY_DIR}/package-check"
-      "-DGenerator=${CMAKE_GENERATOR}"
-      "-DGeneratorPlatform=${CMAKE_GENERATOR_PLATFORM}"
-      "-DConfiguredShaderDir=${RENDERER_SHADER_INSTALL_DIR}"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/package/check.cmake")
-  # 含一次隔离构建（引擎本体 + 两个外部消费者），给足时间。
-  set_tests_properties(package_check PROPERTIES TIMEOUT 1800)
+  if(RENDERER_INSTALL)
+    # 安装 + 导出包 + 外部项目 find_package 构建并离屏运行的端到端检查。
+    add_test(NAME package_check
+      COMMAND ${CMAKE_COMMAND}
+        "-DProjectSource=${CMAKE_CURRENT_SOURCE_DIR}"
+        "-DProjectBuild=${CMAKE_CURRENT_BINARY_DIR}"
+        "-DConfig=$<CONFIG>"
+        "-DPrefix=${CMAKE_CURRENT_BINARY_DIR}/package-check"
+        "-DGenerator=${CMAKE_GENERATOR}"
+        "-DGeneratorPlatform=${CMAKE_GENERATOR_PLATFORM}"
+        "-DMakeProgram=${CMAKE_MAKE_PROGRAM}"
+        "-DGlmSource=${glm_SOURCE_DIR}"
+        "-DStbSource=${stb_SOURCE_DIR}"
+        "-DConfiguredShaderDir=${RENDERER_SHADER_INSTALL_DIR}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/package/check.cmake")
+    # 含一次隔离构建（引擎本体 + 两个外部消费者），给足时间。
+    set_tests_properties(package_check PROPERTIES TIMEOUT 1800)
+  endif()
 endif()
 if(RENDERER_INSTALL)
   install(TARGETS renderer sim_glm EXPORT SimRendererTargets
@@ -152,11 +167,24 @@ if(RENDERER_EXAMPLE)
   FetchContent_Declare(glfw URL https://codeload.github.com/glfw/glfw/zip/refs/tags/3.4 URL_HASH SHA256=a133ddc3d3c66143eba9035621db8e0bcf34dba1ee9514a9e23e96afd39fd57a)
   FetchContent_Declare(imgui URL https://codeload.github.com/ocornut/imgui/zip/refs/tags/v1.91.9b URL_HASH SHA256=fd37507c8476a6d14cc7c4b352401f31bcbd0f0d995d35390811e968c466f46e)
   FetchContent_MakeAvailable(glfw imgui)
-  add_executable(gallery example/main.cpp example/Gallery.cpp
+  # 三个 EXE 共用窗口、PNG 和 ImGui 实现。对象库只参与内部链接。
+  add_library(demo_support OBJECT example/DemoSupport.cpp
     ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp ${imgui_SOURCE_DIR}/imgui_widgets.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
-  target_include_directories(gallery PRIVATE "${stb_SOURCE_DIR}" ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
-  target_compile_definitions(gallery PRIVATE GLFW_INCLUDE_NONE GALLERY_ASSETS="${CMAKE_CURRENT_SOURCE_DIR}/example/assets")
-  target_link_libraries(gallery PRIVATE renderer glfw)
+  target_include_directories(demo_support PRIVATE "${stb_SOURCE_DIR}"
+    PUBLIC "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
+  target_compile_definitions(demo_support PUBLIC GLFW_INCLUDE_NONE)
+  target_link_libraries(demo_support PUBLIC renderer glfw)
+
+  add_executable(gallery example/main.cpp example/Gallery.cpp)
+  target_compile_definitions(gallery PRIVATE GALLERY_ASSETS="${CMAKE_CURRENT_SOURCE_DIR}/example/assets")
+  add_executable(shadow_demo example/shadow_main.cpp example/ShadowDemo.cpp)
+  add_executable(sensor_demo example/sensor_main.cpp example/SensorDemo.cpp)
+  foreach(demo gallery shadow_demo sensor_demo)
+    target_link_libraries(${demo} PRIVATE demo_support)
+  endforeach()
+  if(BUILD_TESTING)
+    add_test(NAME sensor_demo_check COMMAND sensor_demo --check)
+  endif()
 endif()

@@ -15,6 +15,7 @@
 | src/render | RenderScene、View、FrameContext 和请求编排 | 所有模块上传/绘制内联在主调度 |
 | src/render/graph | 声明资源、依赖编译、转换、生命周期 | 材质与点云算法 |
 | src/render/passes | 阴影、几何、光照、TAA、颜色变换、读回 | 隐式访问未声明资源 |
+| src/render/RayShadows.cpp | 为接触增强录制 BLAS/TLAS、管理 Vulkan 构建依赖 | 独立提交或等待 GPU 完成 |
 | src/modules/mesh、points | 类型资产、上传、可见性、pass 注册 | 要求主调度增加类型判断 |
 | src/sensors | 校准、观测元数据与处理链 | 改写原始真值 |
 | src/presentation | 调试输出、显示转换 | 改写其他消费者的颜色 |
@@ -27,7 +28,7 @@
 
 - Scene 由应用修改；SceneSnapshot 固定实例、灯光、时间和不可变资产引用，并按值保存材质。
 - AssetCache 按资产身份缓存几何与贴图、按内容缓存材质；身份构造时分配且不复用。清理只移除缓存引用，未完成提交仍保活资产。
-- RenderScene 持有共享 GPU 数据及上传依赖；不能放某台相机的 oldModel。
+- RenderScene 持有共享 GPU 数据及上传依赖，并为启用 Ray Query 接触增强的视图共享快照 TLAS。BLAS 随几何缓存代际保活，构建缓冲随视图帧回收。
 - View 持有分辨率、相机相关状态、历史注册表和失效版本。
 - FrameContext 持有当次帧槽、命令和临时资源，安全完成后回收。
 - FrameResult 持有当次输出、完成信号和元数据，不被下一帧覆盖。
