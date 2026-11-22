@@ -2,11 +2,11 @@
 
 一个可独立运行的 C++20 / Vulkan 1.3 离屏延迟渲染引擎。场景接口、相机和传感器输出位于 `include/sim`，Vulkan 实现在 `src`，GLFW 和 Dear ImGui 只在 `example` 中使用。开发与审核入口见 [FRAMEWORK](FRAMEWORK.md)，功能、技术、架构和进度分别维护。
 
-![引擎实机渲染的相机展厅](example/preview/courtyard.png)
+![引擎实机渲染的相机展厅](example/preview/courtyard-pcss.png)
 
 ## 构建与运行
 
-Windows 参考环境为 Visual Studio 2022 x64、CMake 3.24 及以上、Vulkan SDK 1.3 及以上（包含 glslc）。设备需要支持动态渲染、至少五个颜色附件和带计算能力的图形队列。以下命令在 renderer 目录运行。首次全新构建会下载校验过的固定版本 GLM、stb、GLFW、Dear ImGui。现有 build 已配置为使用本机下载的源码。
+Windows 参考环境为 Visual Studio 2022 x64、CMake 3.24 及以上、Vulkan SDK 1.3 及以上（包含 glslc）。设备需要支持动态渲染、时间线信号量、独立混合、至少六个颜色附件和带计算能力的图形队列。Ray Query 接触增强另外要求设备支持相应 Vulkan 扩展与特性。以下命令在 renderer 目录运行。首次全新构建会下载校验过的固定版本 GLM、stb、GLFW、Dear ImGui。现有 build 已配置为使用本机下载的源码。
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
@@ -21,6 +21,35 @@ ctest --test-dir build -C Release --output-on-failure
 - `gallery --smoke --validation` 创建隐藏窗口、切换场景、调整窗口尺寸，运行 12 帧后退出。`sensor_check --validation` 验证传感器数据与剔除，`pass_check --validation` 按输出通道核对实际执行的 pass 清单，`points_check --validation` 核对点云与网格的双向遮挡、强度/半径语义、相机姿态与双轴内参下的点尺寸，以及点云变化后 TAA 历史是否刷新、仅 Hdr 请求是否误推进历史基线，`observation_check --validation` 核对标定与投影一致、采样时刻、Beauty 与调试图同帧互不串色、真值通道独立于曝光与抖动、处理链无法覆盖真值。`graph_check` 不需要 GPU 设备，直接检查帧图的裁剪、依赖与诊断；`shader_check` 同样不需要设备，检查着色器目录的解析顺序与失败诊断；`package_check` 由 CTest 驱动，把当前构建安装到全新前缀、核对安装树契约（含导出 target 必须带 `cxx_std_20` 编译特性），再让一个只认 `find_package` 的外部项目构建并离屏渲染（见下节）；配置前缀只做只读检查，两个默认查找分支由测试目录内的隔离构建覆盖，脚本的全部写入与递归清理都限制在自己的测试前缀内。validation 模式需要 SDK 验证层。
 - 仅编译引擎可传入 `-DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF`。gallery 在构建树里靠可执行文件相对路径找到着色器，示例资产仍来自源码目录；安装与外部消费见下节。
 - `python tools/pngdiff.py a.png b.png` 统计两张 PNG 的差异字节数、最大与平均通道差，用于核对捕获画面是否只差舍入。
+
+## 阴影对比 Demo
+
+```powershell
+.\build\Release\gallery.exe --shadow-demo
+.\build\Release\gallery.exe --shadow-demo --shadow-offscreen
+.\build\Release\gallery.exe --shadow-demo --shadow-closeup --capture shadow-compare.png
+.\build\Release\gallery.exe --shadow-benchmark
+.\build\Release\gallery.exe --shadow-benchmark --shadow-closeup
+```
+
+窗口支持并排、屏幕空间接触阴影、Ray Query 接触阴影三种视图。两路共用同一场景快照、相机、四级 CSM 与 PCSS 参数。长柱廊用于观察远近阴影与细栏杆，接触近景用不同悬空高度的球体观察半影。截图左侧为屏幕空间接触，右侧为 Ray Query 接触。缺少设备能力时界面只显示屏幕空间方案，`--raster-shadows` 可用于复现回退。
+
+第三个场景 **Offscreen caster** 把五根遮挡条放在相机后方。屏幕空间只读可见深度，Ray Query 可查询这五根遮挡条并在受光板上补出接触阴影。可用 `--shadow-demo --shadow-offscreen --capture offscreen.png` 导出对照。
+
+点击 **Run benchmark** 或用命令行测量三种方案。每个场景分静止与移动投射物两组，使用固定相机、960×600 分辨率、每级 1024×1024 的 CSM 图块，关闭 TAA，各路径预热 20 帧并记录 100 帧。端到端耗时包含 CPU 录制、GPU 渲染与等待，涵盖动态 TLAS 的构建。另列 `submit p50`，表示从调用 `render()` 到返回的耗时。窗口呈现和图像读回在计时区间之外。
+
+应用可用 `RenderOptions::rayQueryContactShadows` 显式开启增强，通过 `FrameResult::shadowInfo()` 查询实际采用的接触模型及参数。
+
+RTX 3080 Ti 的一次 Release 实测如下，单位为毫秒。静态场景复用 TLAS，移动投射物仍需在对应帧构建 TLAS。
+
+| 场景 | 屏幕空间 p50 / p95 | Ray Query 增强 p50 / p95 | 增强模式提交 p50 |
+|---|---:|---:|---:|
+| 长柱廊，静止 | 3.608 / 4.018 | 3.596 / 4.005 | 3.280 |
+| 长柱廊，移动投射物 | 3.731 / 4.082 | 3.987 / 4.430 | 3.661 |
+| 接触近景，静止 | 0.611 / 0.780 | 0.589 / 0.829 | 0.393 |
+| 接触近景，移动投射物 | 0.710 / 0.987 | 0.855 / 1.067 | 0.609 |
+
+当前 Gallery 的默认画面基线为 [courtyard-pcss.png](example/preview/courtyard-pcss.png)。用 `gallery --capture courtyard-pcss.png --validation` 生成。旧版预览仍可用于历史比对，差异统计见 [实现进度](docs/PROGRESS.md)。
 
 ## 安装与消费
 
@@ -55,7 +84,7 @@ target_link_libraries(app PRIVATE sim::renderer)
 | 帧图 | pass 只声明读写意图，帧图负责反向裁剪、RAW/WAR/WAW 依赖、子资源与缓冲范围求交、屏障推导；跨帧历史以持久导入/导出/恢复表达。阴影、几何、光照、时序解析、颜色变换、读回是彼此独立、可按请求裁剪的 pass |
 | 几何 | Box、Sphere、Cylinder、Cone、Capsule、点集 Convex、索引 TriangleMesh。各生成器输出统一 BufferGeometry |
 | 材质 | GGX 金属粗糙度模型、底色/法线/金属粗糙度纹理、sRGB 解码、mipmap、线性 HDR、色调映射。环境项使用解析天空近似 |
-| 光照 | 一盏方向光，最多 16 盏平方反比衰减点光。方向光采用四级 CSM、光空间 texel 对齐和 3×3 PCF |
+| 光照 | 一盏方向光，最多 16 盏平方反比衰减点光。默认使用四级 CSM、PCSS 和屏幕空间接触阴影，支持的设备可显式启用 Ray Query 接触增强。Gallery 的 `--shadow-demo` 可并排比较 |
 | 剔除 | CPU 包围盒视锥剔除 |
 | TAA | 静止时对 16 个 Halton 子像素样本取线性 HDR 平均，前景与天空边缘均按覆盖率积累。运动时使用无抖动速度、前景速度扩展、逐点深度检验、三次重建和邻域限幅。每个视图独立保存历史 |
 | 传感器 | 按像素指定 fx/fy/cx/cy，GPU 附件访问，可选异步 RGBA8、米制 Z 和 uint32 实例 ID 批量读回，帧携带仿真时间。`observe()` 在同一次提交上另返回标定、采样时间与通道语义，投影由标定反算且与渲染器逐元素一致；处理链只能新增派生输出 |
