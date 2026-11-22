@@ -10,15 +10,16 @@
 
 ## 验证基线
 
-在 renderer 根目录，使用正确配置的 build：
+在仓库根目录使用 x64 Developer PowerShell，选择独立测试预设：
 
 ```powershell
-cmake --build build --config Release
-ctest --test-dir build -C Release --output-on-failure
-.\build\Release\sensor_check.exe --validation
-.\build\Release\temporal_check.exe --validation
-.\build\Release\request_check.exe --validation
-.\build\Release\gallery.exe --smoke --validation
+cmake --preset tests
+cmake --build --preset tests
+ctest --preset tests
+..\rubber-build\tests\sensor_check.exe --validation
+..\rubber-build\tests\gallery.exe --smoke --validation
+..\rubber-build\tests\shadow_demo.exe --smoke --validation
+..\rubber-build\tests\sensor_demo.exe --smoke --validation
 ```
 
 验证层需安装；运行前检查测试支持的参数。新增测试加入 CTest。安装验收必须真正使用安装前缀。只改文档不用重跑 GPU 测试，但须检查链接、状态和代码事实。

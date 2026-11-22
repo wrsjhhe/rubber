@@ -1,0 +1,43 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/../${sourceDirName}-build/${presetName}",
+      "architecture": { "value": "x64", "strategy": "external" },
+      "cacheVariables": { "BUILD_TESTING": "OFF" },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": { "hostOS": [ "Windows" ] }
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "x64 Release",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "debug",
+      "displayName": "x64 Debug",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "tests",
+      "displayName": "x64 Release with tests",
+      "inherits": "release",
+      "cacheVariables": { "BUILD_TESTING": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release", "targets": ["renderer", "gallery", "shadow_demo", "sensor_demo"] },
+    { "name": "debug", "configurePreset": "debug", "targets": ["renderer", "gallery", "shadow_demo", "sensor_demo"] },
+    { "name": "tests", "configurePreset": "tests" }
+  ],
+  "testPresets": [
+    { "name": "tests", "configurePreset": "tests", "output": { "outputOnFailure": true } }
+  ]
+}

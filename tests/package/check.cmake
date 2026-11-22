@@ -135,15 +135,21 @@ function(find_application buildDir outVar)
   set("${outVar}" "${application}" PARENT_SCOPE)
 endfunction()
 
+set(generatorArguments)
+if(Generator)
+  list(APPEND generatorArguments -G "${Generator}")
+endif()
+if(GeneratorPlatform)
+  list(APPEND generatorArguments -A "${GeneratorPlatform}")
+endif()
+if(MakeProgram AND Generator MATCHES "Ninja|Makefiles")
+  list(APPEND generatorArguments "-DCMAKE_MAKE_PROGRAM=${MakeProgram}")
+endif()
+
 function(add_external_project sourceDir buildDir prefixPath outVar)
   set(configureArguments -S "${sourceDir}" -B "${buildDir}"
                          "-DCMAKE_PREFIX_PATH=${prefixPath}" "-DCMAKE_BUILD_TYPE=${Config}")
-  if(Generator)
-    list(APPEND configureArguments -G "${Generator}")
-  endif()
-  if(GeneratorPlatform)
-    list(APPEND configureArguments -A "${GeneratorPlatform}")
-  endif()
+  list(APPEND configureArguments ${generatorArguments})
   run("external configure (${buildDir})" "${CMAKE_COMMAND}" ${configureArguments})
   run("external build (${buildDir})" "${CMAKE_COMMAND}" --build "${buildDir}" --config "${Config}")
   find_application("${buildDir}" application)
@@ -212,9 +218,19 @@ endif()
 # 5b. 两个默认查找分支的确定性覆盖用专属隔离构建完成：全新前缀是测试目录内的子目录，
 #     本次运行亲手创建、验证通过后才清理。正例（安装命中）→ 清理 → 负例（缺失必须
 #     失败），一个运行内两个分支都必然执行。
+# 独立构建复用只读依赖源码。测试可以在没有网络的开发机上重跑。
+set(dependencyArguments)
+if(GlmSource)
+  list(APPEND dependencyArguments "-DFETCHCONTENT_SOURCE_DIR_GLM=${GlmSource}")
+endif()
+if(StbSource)
+  list(APPEND dependencyArguments "-DFETCHCONTENT_SOURCE_DIR_STB=${StbSource}")
+endif()
 run("isolated configure" "${CMAKE_COMMAND}" -S "${ProjectSource}" -B "${isoBuild}"
-        "-DCMAKE_INSTALL_PREFIX=${isoPrefix}" -DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF)
-run("isolated build" "${CMAKE_COMMAND}" --build "${isoBuild}" --config "${Config}")
+        ${generatorArguments} ${dependencyArguments}
+        "-DCMAKE_BUILD_TYPE=${Config}" "-DCMAKE_INSTALL_PREFIX=${isoPrefix}"
+        -DRENDERER_EXAMPLE=OFF -DBUILD_TESTING=OFF)
+run("isolated build" "${CMAKE_COMMAND}" --build "${isoBuild}" --config "${Config}" --parallel 4)
 run("isolated install" "${CMAKE_COMMAND}" --install "${isoBuild}" --config "${Config}" --prefix "${isoPrefix}")
 set(isoConfiguredDir "${isoPrefix}/share/sim/shaders")
 require_file("${isoConfiguredDir}/geometry.vert.spv" "isolated install shader")

@@ -1,0 +1,4 @@
+{
+  "ExcludedItems": [ "build", "build/**", "build-dev", "build-dev/**", "build-m6", "build-m6/**", "build-native", "build-native/**", "out", "out/**" ],
+  "CMakeTargetsViewExcludedItems": [ "CMakeTarget:demo_support", "CMakeTarget:glfw", "CMakeReference:demo_support", "CMakeReference:glfw" ]
+}

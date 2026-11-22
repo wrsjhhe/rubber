@@ -98,7 +98,7 @@ VulkanOutput fence 仅代表生产完成。GPU 消费者须保活 FrameResult，
 
 ## 安装与分发
 
-安装树的契约：`include/sim` 公共头文件、`include/glm`（glm 是公共头文件直接暴露的类型，作为接口目标随包安装，消费侧不能与另一份 glm 混用包含路径）、静态库、按本轮产物清单安装的 SPIR-V（不整装目录，避免把改名前的旧文件带出去）、`lib/cmake/SimRenderer` 的 config/version/targets。导出目标是 `sim::renderer`，`INTERFACE_LINK_LIBRARIES` 里的 `Vulkan::Vulkan` 由包配置的 `find_dependency(Vulkan 1.3)` 提供；不请求 glslc 组件——着色器在构建本库时已经编译，消费者只需要头文件与加载库。示例的 GLFW 强制 `GLFW_INSTALL=OFF`，否则它自己的 install 规则会把 GLFW 头文件与 cmake/pkg-config 配置混进前缀。
+安装树的契约：`include/sim` 公共头文件、`include/glm`（glm 是公共头文件直接暴露的类型，作为接口目标随包安装，消费侧不能与另一份 glm 混用包含路径）、共享库（Windows 安装 bin/renderer.dll 和 lib/renderer.lib 导入库）、按本轮产物清单安装的 SPIR-V（不整装目录，避免把改名前的旧文件带出去）、`lib/cmake/SimRenderer` 的 config/version/targets。导出目标是 `sim::renderer`，`INTERFACE_LINK_LIBRARIES` 里的 `Vulkan::Vulkan` 由包配置的 `find_dependency(Vulkan 1.3)` 提供；不请求 glslc 组件——着色器在构建本库时已经编译，消费者只需要头文件与加载库。示例的 GLFW 强制 `GLFW_INSTALL=OFF`，否则它自己的 install 规则会把 GLFW 头文件与 cmake/pkg-config 配置混进前缀。
 
 shader 目录解析是这一节的核心约束：**二进制不得依赖源码或构建目录寻找 shader**。编译期默认目录是配置时的安装前缀（`${CMAKE_INSTALL_FULL_DATADIR}/sim/shaders`），运行时按四级解析：
 
@@ -109,7 +109,7 @@ shader 目录解析是这一节的核心约束：**二进制不得依赖源码�
 
 设计取舍：前两级是"意图"，错了就失败而不是悄悄换一套着色器出图；后两级是"搜索"，构建树的可执行文件靠第 3 级命中 `build/shaders`（多配置生成器在 `<build>/Release` 下、单配置在 `<build>` 下），安装后的库靠第 4 级。探测文件而不是目录存在性判断，是为了跳过残留的空目录或半删的安装。全部落空时抛出列出全部候选的错误，并提示三种修正手段；`Renderer::shaderDirectory()` 返回实际使用的目录。
 
-用 `cmake --install --prefix` 装到与配置不同的前缀时第 4 级失效——这是接受的边界，不是缺陷：静态库没有可靠的"自身位置"可查，要么显式给目录，要么把应用装进同一前缀布局。诊断文本列出候选路径，包配置导出 `SimRenderer_SHADER_DIR` 供这种场景使用。
+用 `cmake --install --prefix` 装到与配置不同的前缀时第 4 级失效——这是接受的边界，不是缺陷：当前仍按可执行文件位置与配置前缀查找。应用可显式给出 shader 路径，或把 EXE 装入同一前缀布局。Windows 应用运行时需能加载 renderer.dll。诊断文本列出候选路径，包配置导出 `SimRenderer_SHADER_DIR` 供这种场景使用。
 
 覆盖由两个测试承担，各自守不同的失败面。`shader_check`（无 GPU）锁解析顺序、显式/环境变量优先级、无效即报错且点名来源、路径归一化。`package_check`（CTest 脚本）做端到端：装到测试前缀 → 断言安装树契约（头文件、glm、库、全套 SPIR-V；导出的 target 必须带 `cxx_std_20` 编译特性；GLSL 源码不得进入）→ 断言包文件不含源码或构建目录引用 → 用只认 `find_package` 的外部项目构建（消费者不设 CMAKE_CXX_STANDARD，语言标准必须来自导出特性）→ 配置前缀**只读**检查（有合法安装则不带环境变量必须成功并命中配置目录，没有则必须失败且诊断点名配置目录）→ 测试目录内的隔离构建覆盖两个分支（全新前缀：安装命中 → 清理 → 缺失必须失败）→ 保留性断言（验证失败不清理、无 probe 的旧 shader 目录与用户文件逐字节保留）→ 设 `SIM_SHADER_DIR` 指向前缀后渲染成功。脚本的全部写入与递归删除都限制在测试前缀之内并经解析后的绝对路径校验，配置前缀零写入——probe 缺失不代表目录属于测试，不能据此授予所有权（审核发现的删除风险）。
 
